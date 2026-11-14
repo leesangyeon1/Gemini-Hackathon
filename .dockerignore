@@ -1,0 +1,32 @@
+# Git & editor metadata
+.git/
+.gitignore
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Dependencies & build caches
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Local environment secrets (never copy into container image)
+.env
+.env.*
+
+# Local SQLite budget & cache artifacts
+.data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Tests, coverage & logs
+tests/
+coverage/
+logs/
+*.log
+npm-debug.log*
