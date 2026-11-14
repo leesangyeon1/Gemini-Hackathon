@@ -179,4 +179,54 @@ describe('explain/evidenceBuilder', () => {
     const pricingItem = result.evidenceCatalog.find((e) => e.evidenceId === 'ev_prop_pricing');
     expect(pricingItem?.sourceId).toBe('synthetic_demo');
   });
+
+  it('whitelists server-computed AVM spread percentage and contraryEvidence figures in allowedNumbers', () => {
+    const austinCondo: PropertyDetailRecord = {
+      ...mockProperty,
+      id: 'prop_austin_48_east_ave_2002',
+      formattedAddress: '48 East Ave, Unit 2002, Austin, TX 78701',
+      city: 'Austin',
+      state: 'TX',
+      zipCode: '78701',
+      askingPrice: 505000,
+      avmPrice: 401000,
+      avmLow: 321000,
+      avmHigh: 481000,
+      priceGap: {
+        gapPct: -25.93516209476309,
+        gapAmountUsd: -104000,
+        rangePosition: 'above_estimate_range_candidate',
+        askingPrice: 505000,
+        avmPrice: 401000,
+        avmLow: 321000,
+        avmHigh: 481000,
+        isWithinEstimateRange: false,
+        isProvenUndervaluation: false,
+        interpretationNote: 'Asking price exceeds the upper AVM confidence bound.',
+      },
+      contraryEvidence: [
+        {
+          code: 'wide_avm_uncertainty_band',
+          severity: 'caution',
+          title: 'Wide Valuation Uncertainty Band (40% Spread)',
+          detail:
+            'The AVM confidence range spans $321,000 to $481,000 (40% of midpoint), indicating high local price heterogeneity.',
+        },
+      ],
+    };
+
+    const result = buildEvidenceCatalog({
+      property: austinCondo,
+      accessibility: null,
+      environmentalRecords: [],
+      isSyntheticDemo: false,
+    });
+
+    expect(
+      result.evidenceCatalog.some((e) => e.evidenceId === 'ev_contrary_wide_avm_uncertainty_band')
+    ).toBe(true);
+    expect(result.facts.allowedNumbers.has(40)).toBe(true);
+    expect(result.facts.allowedNumbers.has(39.9)).toBe(true);
+    expect(result.facts.allowedNumbers.has(160000)).toBe(true);
+  });
 });

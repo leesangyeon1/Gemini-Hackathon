@@ -1488,7 +1488,7 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
       }
       expect(overCapFailedClosed).toBe(true);
 
-      // Verify honest EXECUTED & EXPORTED AI Studio status and BLOCKED / NOT DEPLOYED Cloud Run status
+      // Verify honest EXECUTED & EXPORTED AI Studio status and DEPLOYED & LIVE Cloud Run status
       const handoffDoc = fs.readFileSync(path.join(REPO_ROOT, 'docs/AI_STUDIO_HANDOFF.md'), 'utf8');
       expect(handoffDoc).toContain('EXECUTED & EXPORTED');
       expect(handoffDoc).toContain('gemini-4-hydrogen');
@@ -1504,21 +1504,32 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
         expect(handoffDoc).toContain(`'${pos}'`);
       }
 
+      const liveServiceUrl = 'https://foreal-estate-uh6bu7tikq-uw.a.run.app';
+
       const deployDoc = fs.readFileSync(path.join(REPO_ROOT, 'docs/DEPLOYMENT.md'), 'utf8');
-      expect(deployDoc).toContain('BLOCKED / NOT DEPLOYED');
+      expect(deployDoc).toContain('DEPLOYED & LIVE');
+      expect(deployDoc).toContain(liveServiceUrl);
+      expect(deployDoc).not.toContain('BLOCKED / NOT DEPLOYED');
 
       const provenanceDoc = fs.readFileSync(
         path.join(REPO_ROOT, 'docs/BUILD_PROVENANCE.md'),
         'utf8'
       );
-      expect(provenanceDoc).toContain('BLOCKED / NOT DEPLOYED');
+      expect(provenanceDoc).toContain('DEPLOYED & LIVE');
+      expect(provenanceDoc).toContain(liveServiceUrl);
       expect(provenanceDoc).toContain('BUILD_PROVENANCE.md');
+      expect(provenanceDoc).not.toContain('BLOCKED / NOT DEPLOYED');
 
       const submissionDoc = fs.readFileSync(path.join(REPO_ROOT, 'docs/SUBMISSION-PACKAGE.md'), 'utf8');
-      expect(submissionDoc).toContain('BLOCKED / NOT DEPLOYED');
+      expect(submissionDoc).toContain('DEPLOYED & LIVE');
+      expect(submissionDoc).toContain(liveServiceUrl);
+      expect(submissionDoc).toContain('NOT YET RECORDED OR POSTED');
+      expect(submissionDoc).not.toContain('BLOCKED / NOT DEPLOYED');
 
       const readmeDoc = fs.readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf8');
-      expect(readmeDoc).not.toContain('.run.app');
+      expect(readmeDoc).toContain('DEPLOYED & LIVE');
+      expect(readmeDoc).toContain(liveServiceUrl);
+      expect(readmeDoc).not.toContain('BLOCKED / NOT DEPLOYED');
     });
 
     it('CR-01: verifies .gcloudignore/.dockerignore/.gitignore secret exclusions, zero VITE_ client secret leaks, runtime GOOGLE_MAPS_BROWSER_KEY isolation, Cloud Run Firestore budget config, and multi-instance sessionStore split-brain behavior', async () => {

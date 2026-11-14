@@ -1,8 +1,8 @@
 # Deployment & Operations Guide (`DEPLOYMENT.md`)
 
 **Owner:** `release` (Workstream 6)  
-**Target Platform:** Google Cloud Run (`0.0.0.0:$PORT`, default `8080`)  
-**Deployment Status:** **`BLOCKED / NOT DEPLOYED`** *(See [Current Deployment Blockers](#7-current-deployment-blockers))*
+**Target Platform:** Google Cloud Run (`0.0.0.0:$PORT`, default `8080`, `us-west1`)  
+**Deployment Status:** **`DEPLOYED & LIVE`** — `https://foreal-estate-uh6bu7tikq-uw.a.run.app` *(regional URL: `https://foreal-estate-1059527957241.us-west1.run.app` — see [Section 7](#7-live-cloud-run-deployment-record))*
 
 ---
 
@@ -122,8 +122,15 @@ Foreal-Estate combines four technical controls to prevent runaway spend:
    - `RENTCAST_INITIAL_SPENT_CALLS=<prior_calls>` subtracts any calls already spent on the RentCast account before deployment
    - Per-session caps (`1` listing search + `5` AVMs default; `10` AVMs + `1` optional property record if user explicitly calls `/api/sessions/:sessionId/expand`)
    - Zero RentCast calls on map pan/zoom or keystroke typing
-3. **Google Cloud API Quotas:**
-   - Configure hard daily/per-minute request quotas for the Gemini API and Maps JavaScript API in Google Cloud Console (`APIs & Services -> Quotas`).
+3. **Google Cloud API Quotas & Billing Budgets (`foreal-estate-514714`):**
+   - **Enforced Cloud Quotas (`cloudquotas.googleapis.com/v1`):**
+     - `maps-backend.googleapis.com/billable_default`: **`500`/day** (`BillableDefaultPerDayPerProject`) and **`60`/min** (`BillableDefaultPerMinutePerProject`)
+     - `maps-backend.googleapis.com/3d_billable_default`: **`200`/day** (`3DBillableDefaultPerDayPerProject`) and **`30`/min** (`3DBillableDefaultPerMinutePerProject`)
+     - `generativelanguage.googleapis.com/model_requests` (`us-west1`): **`60`/min** (`ModelRequestsPerMinutePerProjectPerRegion`)
+     - `generativelanguage.googleapis.com/generate_requests_per_model_per_day` & `generate_requests_per_model`: **`500`/day** and **`30`/min** across `gemini-3.8-flash`, `gemini-3.5-flash`, `gemini-2.5-flash`, and `gemini-4-hydrogen`
+   - **Dual $10 USD Monthly Cloud Billing Budgets (`01B62E-F9939A-2D3414`):**
+     - `foreal-estate-foreal-estate-514714` (`0e648124-48ef-4e7b-a328-1fcb33de8795`): `10 USD` monthly net spend (`INCLUDE_ALL_CREDITS`), thresholds `50%` / `80%` / `100%`
+     - `foreal-estate-gross-credit-guard-514714` (`3279fa3f-a3f3-47ab-aa6e-44547b76c1b1`): `10 USD` monthly gross usage (`EXCLUDE_ALL_CREDITS`) to alert early at `$5` / `$8` / `$10` of `$300` promotional trial credit consumption
 4. **Upstream Timeouts & Degraded Resilience:**
    - Geocoding (`6,000 ms`), Overpass/EPA (`10,000 ms`), RentCast (`8,000 ms`), and Gemini (`10,000 ms`) use `AbortSignal.timeout`. If Gemini quota or timeout triggers, `/api/explain` degrades cleanly (`explanationAvailable: false`) without breaking deterministic scoring or price comparisons.
 
@@ -226,16 +233,18 @@ gcloud run services update-traffic foreal-estate \
 
 ---
 
-## 7. Current Deployment Blockers
+## 7. Live Cloud Run Deployment Record
 
-- **Hosted Prototype URL:** **`BLOCKED / NOT DEPLOYED`**
-- **Phase 4 / Phase 5 Read-Only Google Cloud Environment Audit (Rechecked `2026-11-14 05:44 PT`, Google Cloud SDK `593.0.0`):**
-  1. **`gcloud` CLI & Active Auth (`verified`):** `/opt/homebrew/bin/gcloud --version` (exit `0`, SDK `593.0.0`); `/opt/homebrew/bin/gcloud auth list` (exit `0`, active live account `qcd2529@gmail.com`); `/opt/homebrew/bin/gcloud config list` (exit `0`, `core.account = qcd2529@gmail.com`, no `core.project` or `run.region` set).
-  2. **Application Default Credentials (`missing` — NOT required for deploy):** `test -f /Users/isang-yeon/.config/gcloud/application_default_credentials.json` exited `1` (absent); neither deployment script requires local ADC.
-  3. **Projects & Billing (`verified` active projects, `missing` billing as of `2026-11-14 05:44 PT`):** `/opt/homebrew/bin/gcloud projects list` (exit `0`) still shows the same two `ACTIVE` projects (`gen-lang-client-0222559199` / `Petpulse` `#733697811999` and `gen-lang-client-0582732543` / `n8ntest` `#686829907635`). `/opt/homebrew/bin/gcloud billing accounts list` (exit `0`) returned `Listed 0 items.`, and `/opt/homebrew/bin/gcloud billing projects describe` (exit `0`) confirmed `billingAccountName: ''` and `billingEnabled: false` on **both** projects. Billing budgets (`gcloud billing budgets list`) are `not checked` because no billing account ID exists.
-  4. **Enabled APIs, Cloud Run, Secrets, Service Accounts & Keys (`missing` / `SERVICE_DISABLED`):**
-     - `gen-lang-client-0222559199`: `services list --enabled` (exit `0`) shows only `generativelanguage.googleapis.com`, `playintegrity.googleapis.com`, `telemetry.googleapis.com`. `run services list --quiet` (exit `1`, `SERVICE_DISABLED` for `run.googleapis.com`), `secrets list --quiet` (exit `1`, `SERVICE_DISABLED` for `secretmanager.googleapis.com`), `iam service-accounts list` (exit `0`, `0` items), `services api-keys list` (exit `0`, `0` items).
-     - `gen-lang-client-0582732543`: `services list --enabled --quiet` (exit `0`) shows only `generativelanguage.googleapis.com`, `playintegrity.googleapis.com`. `run services list --quiet` (exit `1`, `SERVICE_DISABLED` for `run.googleapis.com`), `secrets list --quiet` (exit `1`, `SERVICE_DISABLED` for `secretmanager.googleapis.com`), `iam service-accounts list --quiet` (exit `0`, `0` items), `services api-keys list --quiet` (exit `0`, `0` items).
-  5. **Google One AI Ultra / GCP Promotional Credits (`inaccessible` via `gcloud`):** `gcloud` provides no CLI command to query promotional or Google One AI credit balances; remaining credits must be inspected manually in the Google Cloud Console Billing (**Overview** / **Incentives**) or Google AI Studio billing dashboard.
-  6. **Unconfirmed Deployment Target & Secrets (`missing`):** No confirmed `GOOGLE_CLOUD_PROJECT`, `CLOUD_RUN_REGION`, `CLOUD_RUN_SERVICE_ACCOUNT`, `CONFIRM_BILLING_AND_SPENDING_LIMITS=true`, Firestore `(default)` database, or Secret Manager secrets (`RENTCAST_API_KEY`, `GEMINI_API_KEY`) have been provisioned.
-- **Unblocking Action:** Select or create a billing-enabled GCP project (confirming any Google One AI Ultra / GCP credits in Console), enable `run.googleapis.com`, `cloudbuild.googleapis.com`, `secretmanager.googleapis.com`, and `firestore.googleapis.com`, provision the runtime service account and Secret Manager secrets, and run `./scripts/deploy-cloud-run.sh` with `CONFIRM_BILLING_AND_SPENDING_LIMITS=true`.
+- **Hosted Prototype URL (`status.url`):** `https://foreal-estate-uh6bu7tikq-uw.a.run.app`
+- **Deterministic Regional URL:** `https://foreal-estate-1059527957241.us-west1.run.app`
+- **GCP Project & Region:** `foreal-estate-514714` (Project Number `1059527957241`), region `us-west1`
+- **Deployed Service & Revision:** `foreal-estate` (`foreal-estate-00002-crt`, 100% traffic, `--min-instances=0`, `--max-instances=1`, `--session-affinity`, `--concurrency=20`, `--timeout=30`)
+- **Runtime Service Account:** `foreal-estate-runtime@foreal-estate-514714.iam.gserviceaccount.com` (`roles/datastore.user`, `roles/aiplatform.user`, and per-secret `roles/secretmanager.secretAccessor` only on `foreal-rentcast-api-key` and `foreal-gemini-api-key`)
+- **Firestore Durable Store:** `projects/foreal-estate-514714/databases/(default)` (`FIRESTORE_NATIVE`, `us-west1`, `FIRESTORE_BUDGET_COLLECTION=rentcast_budget`)
+- **Pinned Numeric Secret Manager Versions & Reconciled RentCast Quota:**
+  - `RENTCAST_API_KEY` -> `foreal-rentcast-api-key:1` (`ENABLED`; `RENTCAST_GLOBAL_MONTHLY_LIMIT=35`, `RENTCAST_INITIAL_SPENT_CALLS=1` pre-deploy CLI probe + `2` Cloud Run E2E runtime calls persisted in Firestore `rentcast_budget/2026-11` = **`3` total calls spent, `32` remaining**)
+  - `GEMINI_API_KEY` -> `foreal-gemini-api-key:2` (`ENABLED`; version `1` `DISABLED`; bound to `foreal-estate-runtime@foreal-estate-514714.iam.gserviceaccount.com` restricted to `aiplatform.googleapis.com` with `GOOGLE_GENAI_USE_VERTEXAI=true`, `GEMINI_EXPLAIN_MODEL=projects/foreal-estate-514714/locations/global/publishers/google/models/gemini-3.8-flash`, `GEMINI_EXPLAIN_FALLBACK_MODEL=projects/foreal-estate-514714/locations/global/publishers/google/models/gemini-3.5-flash`)
+- **Maps Browser Key Restrictions (`foreal-estate-maps-browser`):**
+  - API Target: `maps-backend.googleapis.com`
+  - Allowed HTTP Referrers: `http://localhost:5173/*`, `http://localhost:8080/*`, `http://127.0.0.1:5173/*`, `http://127.0.0.1:8080/*`, `https://foreal-estate-1059527957241.us-west1.run.app/*`, `https://foreal-estate-uh6bu7tikq-uw.a.run.app/*`
+- **Historical Audit Note:** Prior Stage 3 / Phase 5 pre-billing environment audits (`2026-11-14 05:44 PT`) recorded a pre-provisioning un-deployed status before billing account `01B62E-F9939A-2D3414` (`$10 USD` ceiling + `$300` promotional trial credit) and dedicated project `foreal-estate-514714` were authorized and provisioned.

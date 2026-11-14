@@ -13,6 +13,14 @@ Foreal-Estate helps home shoppers explore **any user-selected US location** (cit
 
 ---
 
+## Live Hosted Prototype (`DEPLOYED & LIVE`)
+
+- **Primary Cloud Run URL (`us-west1`):** <https://foreal-estate-uh6bu7tikq-uw.a.run.app>
+- **Deterministic Regional URL:** <https://foreal-estate-1059527957241.us-west1.run.app>
+- **GCP Project & Region:** `foreal-estate-514714` (`us-west1`), backed by Firestore Native (`rentcast_budget` durable atomic quota & session store), Secret Manager (`foreal-rentcast-api-key`, `foreal-gemini-api-key`), Vertex-grounded Gemini structured explanations (`GOOGLE_GENAI_USE_VERTEXAI=true`), HTTP-referrer-restricted Maps JavaScript basemap, enforced Cloud Quotas ceilings, and dual `$10 USD` Cloud Billing budgets (see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
+
+---
+
 ## Documentation Index
 
 | Document | Scope & Single Source of Truth | Owner |
@@ -50,6 +58,7 @@ Foreal-Estate helps home shoppers explore **any user-selected US location** (cit
 | `BUDGET_STORE_MODE` | Server config | `firestore` (Cloud Run durable atomic counter) or `sqlite` (local dev durable store) |
 | `GOOGLE_CLOUD_PROJECT` | Server config | GCP project ID for Firestore durable budget counter / Cloud Run deployment |
 | `GEMINI_API_KEY` | **Server secret** (Secret Manager) | Server-side key for `/api/explain` grounded structured explanations |
+| `GOOGLE_GENAI_USE_VERTEXAI` | Server config | Routes `@google/genai` through Vertex AI (`aiplatform.googleapis.com`) when `true` |
 | `GEMINI_EXPLAIN_MODEL` | Server config | Runtime Gemini model preference (defaults to `gemini-4-hydrogen` with documented fallback) |
 | `GOOGLE_MAPS_BROWSER_KEY` | Restricted browser key | HTTP-referrer-restricted Maps JS basemap key served via `/api/config` |
 | `GOOGLE_PLACES_SERVER_KEY` | **Server secret** (optional) | Display-only Places context (`google_places_context`; barred from scoring) |

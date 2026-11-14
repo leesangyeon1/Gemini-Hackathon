@@ -12,7 +12,7 @@
 > 2. **Track Confirmation & Social Tracking Duration Conflict:** Confirm your intended submission track (**In-person** vs. **Online-only**) and verify the **social-media tracking duration conflict (`7 days` vs. `2 weeks`) directly on the official hackathon submission form** before checking any consent or posting agreement.
 > 3. **VC Prize Clarification:** The VC prize listed by the event is a **VC meeting**, **not** guaranteed funding or an investment commitment.
 > 4. **Organizer & Marketing Consent Control:** Organizer/marketing data-sharing and promotional consents remain **strictly under the user's control** — review every checkbox on the official form manually before submitting.
-> 5. **Hosted Prototype URL Status:** **`BLOCKED / NOT DEPLOYED`** (see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md#7-current-deployment-blockers) and [`docs/BUILD_PROVENANCE.md`](BUILD_PROVENANCE.md)). Do **not** submit a fake or placeholder live URL; deploy via `./scripts/deploy-cloud-run.sh` with confirmed GCP credentials first, or submit under local/repository review instructions if permitted by your track.
+> 5. **Hosted Prototype URL Status:** **`DEPLOYED & LIVE`** at **`https://foreal-estate-uh6bu7tikq-uw.a.run.app`** (regional URL: `https://foreal-estate-1059527957241.us-west1.run.app`, GCP project `foreal-estate-514714`, region `us-west1`; see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md#7-live-cloud-run-deployment-record) and [`docs/BUILD_PROVENANCE.md`](BUILD_PROVENANCE.md)).
 
 ---
 
@@ -27,7 +27,7 @@ TRACK: [PLACEHOLDER: Confirm "In-person (Nov 14, 10:30 AM PT)" OR "Online-only (
 CONTACT EMAIL / HANDLE: [PLACEHOLDER: Primary Contact Email & Social Handle]
 REPOSITORY / DEMO LINKS:
 - Source Repository: [PLACEHOLDER: GitHub / Git Repo URL]
-- Hosted Cloud Run URL: BLOCKED / NOT DEPLOYED (deploy via scripts/deploy-cloud-run.sh once GCP project/billing/Secret Manager are provisioned)
+- Hosted Cloud Run URL: https://foreal-estate-uh6bu7tikq-uw.a.run.app (regional: https://foreal-estate-1059527957241.us-west1.run.app — GCP project foreal-estate-514714, region us-west1)
 - 2-Min Team/Pitch Video: NOT YET RECORDED OR POSTED
 - 1-Min Prototype Playcast Video: NOT YET RECORDED OR POSTED
 
@@ -62,7 +62,7 @@ Foreal-Estate is a full-stack TypeScript/Node + React web application working ac
 3. Separate Environmental Due-Diligence Layer: Queries US EPA Facility Registry Service (FRS) records into an independent toggleable layer — never merged silently into positive amenity scores and never making automated health determinations.
 4. Strict Google Maps ToS Isolation: Google Maps JS provides the basemap via an HTTP-referrer-restricted browser key; optional display-only Places context (`google_places_context`) is barred by a frozen server source-policy registry from scoring, heatmaps, storage, and AI prompts.
 5. On-Demand Asking-vs-AVM Comparison & Contrary Evidence: Fetches RentCast active listings (`<= 25`) and on-demand single-home AVM point + `[avmLow, avmHigh]` estimates protected by a durable atomic budget store (Firestore on Cloud Run, built-in `node:sqlite` locally) capped below RentCast's 50-call monthly free tier. Displays `gapPct = 100 * (avmPrice - askingPrice) / avmPrice` alongside `[avmLow, avmHigh]` range position, last deed sale, tax assessment, and contrary evidence (such as subject-in-comps circularity).
-6. Server-Grounded Gemini Explanation (`/api/explain`): Server computes all math and passes bounded eligible `evidenceIds` to Gemini (`gemini-4-hydrogen` with `gemini-2.5-flash` fallback). Returned structured JSON is validated against server facts and falls back cleanly if Gemini is unavailable.
+6. Server-Grounded Gemini Explanation (`/api/explain`): Server computes all math and passes bounded eligible `evidenceIds` to Gemini (deployed on Cloud Run with Vertex AI `gemini-3.8-flash` primary and `gemini-3.5-flash` fallback; code defaults `gemini-4-hydrogen` / `gemini-2.5-flash`). Returned structured JSON is validated against server facts and falls back cleanly if Gemini is unavailable.
 
 NON-CLAIMS & SAFETY:
 - Not an appraisal, brokerage feed, or investment advice; AVM is a statistical estimate.
@@ -72,7 +72,7 @@ NON-CLAIMS & SAFETY:
 CURRENT PROTOTYPE STATUS:
 - Fresh-code prototype built during the Nov 13-14, 2026 hackathon window via Antigravity CLI.
 - Supports live API keys as well as explicit opt-in badged synthetic demo mode (`ENABLE_SYNTHETIC_DEMO_MODE=true`).
-- No external user traction claimed; Cloud Run hosted URL currently BLOCKED / NOT DEPLOYED pending GCP project/billing/Secret Manager provisioning.
+- Deployed & live on Google Cloud Run (`https://foreal-estate-uh6bu7tikq-uw.a.run.app`, project `foreal-estate-514714`, region `us-west1`); zero external user traction claimed.
 ```
 
 ---
@@ -123,9 +123,9 @@ Voiceover: "Gemini explains only server-computed facts and verified evidence IDs
 
 ---
 
-## (d) Accessible Code & Local Review Instructions
+## (d) Accessible Live Prototype, Code & Local Review Instructions
 
-Because Cloud Run deployment is currently **`BLOCKED / NOT DEPLOYED`**, reviewers and judges can inspect and run the full prototype locally in minutes:
+Reviewers and judges can evaluate the **live hosted Cloud Run prototype (`DEPLOYED & LIVE`)** directly at **`https://foreal-estate-uh6bu7tikq-uw.a.run.app`** (regional URL: `https://foreal-estate-1059527957241.us-west1.run.app`, GCP project `foreal-estate-514714`, region `us-west1`), or inspect and run the full prototype locally in minutes:
 
 ### 1. Prerequisites
 - **Node.js `>= 22.5.0`** (verified on `v24.7.0`) and **npm `>= 10`** (verified on `11.7.0`).
@@ -176,7 +176,7 @@ npm run build
    - Durable atomic budget store (`node:sqlite` locally, Firestore REST transactions on Cloud Run) protecting a `< 50`-call RentCast monthly cap across restarts.
    - Server-first Gemini grounding: Gemini never performs math and every returned `evidenceId` is validated server-side.
 4. **3:00–4:00 — Ethical & Compliance Guardrails:** No hardcoded city; viewport circle != official boundary; geodesic radius != walking isochrone; fast-food default weight `0` with zero causal appreciation claims; no demographic/protected-class scoring; AVM != appraisal.
-5. **4:00–5:00 — Roadmap & Honest Status:** Multi-stage verification suite, Cloud Run IaC/scripts ready pending GCP project/Secret Manager provisioning, and clear path from MVP to real-world buyer/agent workflows.
+5. **4:00–5:00 — Roadmap & Honest Status:** Multi-stage verification suite, live Cloud Run deployment (`https://foreal-estate-uh6bu7tikq-uw.a.run.app`, `us-west1`) with Firestore atomic quota caps and Secret Manager isolation, and clear path from MVP to real-world buyer/agent workflows.
 
 ### Judge Q&A Mapping (All 5 Evaluation Dimensions)
 
@@ -186,4 +186,4 @@ npm run build
 | **2. Novelty** | *How is this different from Zillow/Redfin or generic LLM property wrappers?* | Instead of opaque black-box neighborhood scores or ungrounded chat, Foreal-Estate combines: (a) user-editable multi-category Venn overlap zones computed strictly from ODbL OpenStreetMap data, (b) a separate non-merged US EPA FRS due-diligence layer, (c) explicit AVM uncertainty & **subject-in-comps circularity detection** as contrary evidence, and (d) a strict server source-policy registry enforcing Google Maps Platform Section 3.2.3 compliance. |
 | **3. Applicability** | *Does this only work in one demo city, and who uses it today?* | It works across **any US city, neighborhood, ZIP code, or bounded map circle** using US Census Geocoder, OSM Nominatim/Overpass, US EPA FRS, and RentCast—never hardcoded to Berkeley. It serves homebuyers, relocating families, and buyer's agents performing structured location and pricing due diligence, while explicitly disclaiming that it is not an appraisal or financial advice. |
 | **4. Fundability** | *What is the business/monetization path beyond a hackathon prototype (noting VC prize is a meeting, not guaranteed funding)?* | Near-term SaaS/usage tiers for relocating homebuyers and buyer-side brokerages needing auditable location + comps due-diligence briefs, moving from developer API tiers to commercial RentCast/managed Overpass/Places Aggregate licensing as usage scales. We view a **VC meeting** as an opportunity to validate unit economics around licensed data costs and B2B2C brokerage distribution. |
-| **5. Honest Prototype Traction** | *What traction, users, or live deployment metrics do you have right now?* | **Zero fabricated traction:** This is a fresh-code hackathon prototype created on Nov 13–14, 2026 (`11d0d4d9-cb75-4ee7-bd5e-49b4d1351dd7`). There are no active external users, revenue, or published social engagement metrics yet; Cloud Run deployment is documented and scripted (`Dockerfile`, `scripts/deploy-cloud-run.sh`) but currently `BLOCKED / NOT DEPLOYED` pending GCP project/billing/Secret Manager provisioning. |
+| **5. Honest Prototype Traction** | *What traction, users, or live deployment metrics do you have right now?* | **Zero fabricated traction:** This is a fresh-code hackathon prototype created on Nov 13–14, 2026 (`11d0d4d9-cb75-4ee7-bd5e-49b4d1351dd7`). It is **`DEPLOYED & LIVE`** on Google Cloud Run at `https://foreal-estate-uh6bu7tikq-uw.a.run.app` (`foreal-estate-514714`, `us-west1`), with zero active external users, revenue, or published social engagement metrics claimed. |

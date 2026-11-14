@@ -10,16 +10,117 @@ set -euo pipefail
 #
 # Strict preflight checks enforce:
 #   - Confirmed GCP project, Cloud Run region (defaults to `us-west1`), and SA
+#   - Safe non-secret config fallback from `.env` if unset in environment
+#     (GOOGLE_CLOUD_PROJECT, RENTCAST_GLOBAL_MONTHLY_LIMIT,
+#      RENTCAST_INITIAL_SPENT_CALLS, GOOGLE_MAPS_BROWSER_KEY) without echoing keys
 #   - Explicit user confirmation of billing & hard spending/quota controls
+#     (CONFIRM_BILLING_AND_SPENDING_LIMITS=true) BEFORE any gcloud call
 #   - Verified ENABLED numeric Secret Manager versions (never assumes `1` or `latest`)
 #   - Optional GOOGLE_PLACES_SERVER_KEY only when ENABLE_PLACES_SERVER_SECRET=true
 #   - Best-effort session affinity + max-instances=1 + durable Firestore budget/session store
 #   - RentCast global monthly limit strictly below the 50-call free tier
+#   - Post-deploy tightening/enforcement of `foreal-estate-maps-browser` API key
+#     restrictions to `maps-backend.googleapis.com` and exact dev + deployed origins
 # ==============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DOTENV_FILE="${DOTENV_FILE:-${REPO_ROOT}/.env}"
+
+fail() {
+  echo "[deploy-cloud-run] ERROR: $*" >&2
+  exit 1
+}
+
+require_env() {
+  local var_name="$1"
+  local value="${!var_name:-}"
+  if [[ -z "${value// }" ]]; then
+    fail "Required environment variable '${var_name}' is not set."
+  fi
+}
+
+# Pure-bash .env reader: never sources, evaluates, or prints values to terminal.
+read_dotenv_var() {
+  local dotenv_path="$1"
+  local target_key="$2"
+  if [[ ! -f "${dotenv_path}" ]]; then
+    return 0
+  fi
+  local line key val
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    if [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    if [[ "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+      key="${BASH_REMATCH[2]}"
+      val="${BASH_REMATCH[3]}"
+      if [[ "${key}" == "${target_key}" ]]; then
+        if [[ "${val}" =~ ^\"(.*)\"[[:space:]]*$ ]]; then
+          val="${BASH_REMATCH[1]}"
+        elif [[ "${val}" =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+          val="${BASH_REMATCH[1]}"
+        else
+          val="${val#"${val%%[![:space:]]*}"}"
+          val="${val%"${val##*[![:space:]]}"}"
+        fi
+        printf '%s' "${val}"
+        return 0
+      fi
+    fi
+  done < "${dotenv_path}"
+}
+
+# Runs a gcloud command while suppressing LRO status payloads and scrubbing any
+# key material from error output if the command fails.
+run_gcloud_redacted() {
+  local raw_out=""
+  local exit_code=0
+  raw_out="$("$@" 2>&1)" || exit_code=$?
+  if (( exit_code != 0 )); then
+    local safe_out=""
+    safe_out="$(printf '%s' "${raw_out}" | python3 -c '
+import re, sys
+s = sys.stdin.read()
+s = re.sub(r"(\"keyString\"\s*:\s*\")[^\"]+(\")", r"\1[REDACTED]\2", s)
+s = re.sub(r"(keyString\s*[:=]\s*)\S+", r"\1[REDACTED]", s)
+s = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[REDACTED_GCP_KEY]", s)
+sys.stdout.write(s)
+')"
+    unset raw_out
+    fail "gcloud command failed (exit ${exit_code}): ${safe_out}"
+  fi
+  unset raw_out
+}
+
+# Safely load non-secret config defaults from .env if unset in environment (never echoed)
+if [[ -z "${GOOGLE_CLOUD_PROJECT+x}" ]]; then
+  GOOGLE_CLOUD_PROJECT="$(read_dotenv_var "${DOTENV_FILE}" "GOOGLE_CLOUD_PROJECT")"
+fi
+if [[ -z "${RENTCAST_GLOBAL_MONTHLY_LIMIT+x}" ]]; then
+  RENTCAST_GLOBAL_MONTHLY_LIMIT="$(read_dotenv_var "${DOTENV_FILE}" "RENTCAST_GLOBAL_MONTHLY_LIMIT")"
+fi
+if [[ -z "${RENTCAST_INITIAL_SPENT_CALLS+x}" ]]; then
+  RENTCAST_INITIAL_SPENT_CALLS="$(read_dotenv_var "${DOTENV_FILE}" "RENTCAST_INITIAL_SPENT_CALLS")"
+fi
+if [[ -z "${GOOGLE_MAPS_BROWSER_KEY+x}" ]]; then
+  GOOGLE_MAPS_BROWSER_KEY="$(read_dotenv_var "${DOTENV_FILE}" "GOOGLE_MAPS_BROWSER_KEY")"
+fi
+if [[ -z "${GEMINI_EXPLAIN_MODEL+x}" ]]; then
+  GEMINI_EXPLAIN_MODEL="$(read_dotenv_var "${DOTENV_FILE}" "GEMINI_EXPLAIN_MODEL")"
+fi
+if [[ -z "${GEMINI_EXPLAIN_FALLBACK_MODEL+x}" ]]; then
+  GEMINI_EXPLAIN_FALLBACK_MODEL="$(read_dotenv_var "${DOTENV_FILE}" "GEMINI_EXPLAIN_FALLBACK_MODEL")"
+fi
+if [[ -z "${GOOGLE_GENAI_USE_VERTEXAI+x}" ]]; then
+  GOOGLE_GENAI_USE_VERTEXAI="$(read_dotenv_var "${DOTENV_FILE}" "GOOGLE_GENAI_USE_VERTEXAI")"
+fi
 
 GCLOUD_BIN="${GCLOUD_BIN:-$(command -v gcloud 2>/dev/null || echo /opt/homebrew/bin/gcloud)}"
 SERVICE_NAME="${CLOUD_RUN_SERVICE_NAME:-foreal-estate}"
 CLOUD_RUN_REGION="${CLOUD_RUN_REGION:-us-west1}"
+GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
 
 RENTCAST_SECRET_NAME="${RENTCAST_SECRET_NAME:-foreal-rentcast-api-key}"
 GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-foreal-gemini-api-key}"
@@ -38,24 +139,13 @@ CLOUD_RUN_TIMEOUT="${CLOUD_RUN_TIMEOUT:-30}"
 RENTCAST_GLOBAL_MONTHLY_LIMIT="${RENTCAST_GLOBAL_MONTHLY_LIMIT:-35}"
 RENTCAST_INITIAL_SPENT_CALLS="${RENTCAST_INITIAL_SPENT_CALLS:-0}"
 FIRESTORE_BUDGET_COLLECTION="${FIRESTORE_BUDGET_COLLECTION:-rentcast_budget}"
-GEMINI_EXPLAIN_MODEL="${GEMINI_EXPLAIN_MODEL:-gemini-4-hydrogen}"
-GEMINI_EXPLAIN_FALLBACK_MODEL="${GEMINI_EXPLAIN_FALLBACK_MODEL:-gemini-2.5-flash}"
+GEMINI_EXPLAIN_MODEL="${GEMINI_EXPLAIN_MODEL:-projects/${GOOGLE_CLOUD_PROJECT}/locations/global/publishers/google/models/gemini-3.8-flash}"
+GEMINI_EXPLAIN_FALLBACK_MODEL="${GEMINI_EXPLAIN_FALLBACK_MODEL:-projects/${GOOGLE_CLOUD_PROJECT}/locations/global/publishers/google/models/gemini-3.5-flash}"
+GOOGLE_GENAI_USE_VERTEXAI="${GOOGLE_GENAI_USE_VERTEXAI:-true}"
 OSM_OVERPASS_URL="${OSM_OVERPASS_URL:-https://overpass-api.de/api/interpreter}"
 ENABLE_SYNTHETIC_DEMO_MODE="${ENABLE_SYNTHETIC_DEMO_MODE:-false}"
 GOOGLE_MAPS_BROWSER_KEY="${GOOGLE_MAPS_BROWSER_KEY:-}"
-
-fail() {
-  echo "[deploy-cloud-run] ERROR: $*" >&2
-  exit 1
-}
-
-require_env() {
-  local var_name="$1"
-  local value="${!var_name:-}"
-  if [[ -z "${value// }" ]]; then
-    fail "Required environment variable '${var_name}' is not set."
-  fi
-}
+MAPS_BROWSER_KEY_DISPLAY_NAME="${MAPS_BROWSER_KEY_DISPLAY_NAME:-foreal-estate-maps-browser}"
 
 resolve_verified_secret_version() {
   local secret_name="$1"
@@ -109,6 +199,7 @@ require_env "GOOGLE_CLOUD_PROJECT"
 require_env "CLOUD_RUN_REGION"
 require_env "CLOUD_RUN_SERVICE_ACCOUNT"
 
+# Strict fail-closed gate BEFORE any gcloud call
 if [[ "${CONFIRM_BILLING_AND_SPENDING_LIMITS:-}" != "true" ]]; then
   fail "Set CONFIRM_BILLING_AND_SPENDING_LIMITS=true after verifying GCP billing alerts/caps, Cloud Run max-instances, and RentCast monthly limits."
 fi
@@ -133,15 +224,15 @@ if ! [[ "${CLOUD_RUN_CONCURRENCY}" =~ ^[0-9]+$ ]] || (( CLOUD_RUN_CONCURRENCY < 
   fail "CLOUD_RUN_CONCURRENCY must be a positive integer. Got: '${CLOUD_RUN_CONCURRENCY}'."
 fi
 
-# Reject commas in non-secret env vars that use comma-delimited gcloud flags
-for env_val in \
-  "${GOOGLE_CLOUD_PROJECT}" \
-  "${CLOUD_RUN_REGION}" \
-  "${CLOUD_RUN_SERVICE_ACCOUNT}" \
-  "${GOOGLE_MAPS_BROWSER_KEY}" \
-  "${OSM_OVERPASS_URL}"; do
-  if [[ "${env_val}" == *","* ]]; then
-    fail "Environment value '${env_val}' contains a comma, which breaks gcloud --set-env-vars parsing."
+# Reject commas in env vars passed to comma-delimited gcloud flags (log variable name only, never key value)
+for env_name in \
+  GOOGLE_CLOUD_PROJECT \
+  CLOUD_RUN_REGION \
+  CLOUD_RUN_SERVICE_ACCOUNT \
+  GOOGLE_MAPS_BROWSER_KEY \
+  OSM_OVERPASS_URL; do
+  if [[ "${!env_name}" == *","* ]]; then
+    fail "Environment variable '${env_name}' contains a comma, which breaks gcloud --set-env-vars parsing."
   fi
 done
 
@@ -170,6 +261,7 @@ ENV_VARS_ARG="${ENV_VARS_ARG},RENTCAST_GLOBAL_MONTHLY_LIMIT=${RENTCAST_GLOBAL_MO
 ENV_VARS_ARG="${ENV_VARS_ARG},RENTCAST_INITIAL_SPENT_CALLS=${RENTCAST_INITIAL_SPENT_CALLS}"
 ENV_VARS_ARG="${ENV_VARS_ARG},GEMINI_EXPLAIN_MODEL=${GEMINI_EXPLAIN_MODEL}"
 ENV_VARS_ARG="${ENV_VARS_ARG},GEMINI_EXPLAIN_FALLBACK_MODEL=${GEMINI_EXPLAIN_FALLBACK_MODEL}"
+ENV_VARS_ARG="${ENV_VARS_ARG},GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI}"
 ENV_VARS_ARG="${ENV_VARS_ARG},OSM_OVERPASS_URL=${OSM_OVERPASS_URL}"
 ENV_VARS_ARG="${ENV_VARS_ARG},ENABLE_SYNTHETIC_DEMO_MODE=${ENABLE_SYNTHETIC_DEMO_MODE}"
 
@@ -179,7 +271,7 @@ fi
 
 echo "[deploy-cloud-run] Deploying '${SERVICE_NAME}' to Cloud Run (${CLOUD_RUN_REGION})..."
 "${GCLOUD_BIN}" run deploy "${SERVICE_NAME}" \
-  --source=. \
+  --source="${REPO_ROOT}" \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --region="${CLOUD_RUN_REGION}" \
   --port=8080 \
@@ -202,6 +294,29 @@ SERVICE_URL="$("${GCLOUD_BIN}" run services describe "${SERVICE_NAME}" \
 
 if [[ -z "${SERVICE_URL}" ]]; then
   fail "Deployment completed, but failed to retrieve status.url for '${SERVICE_NAME}'."
+fi
+
+MAPS_BROWSER_KEY_NAME="$("${GCLOUD_BIN}" services api-keys list \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --filter="displayName=\"${MAPS_BROWSER_KEY_DISPLAY_NAME}\"" \
+  --format="value(name)" \
+  --limit=1 \
+  --quiet 2>/dev/null || echo "")"
+
+if [[ -n "${MAPS_BROWSER_KEY_NAME}" ]]; then
+  MAPS_BASE_ALLOWED_REFERRERS="http://localhost:5173/*,http://localhost:8080/*,http://127.0.0.1:5173/*,http://127.0.0.1:8080/*,https://foreal-estate-1059527957241.us-west1.run.app/*"
+  NORMALIZED_SERVICE_URL="${SERVICE_URL%/}"
+  if [[ ",${MAPS_BASE_ALLOWED_REFERRERS}," == *,"${NORMALIZED_SERVICE_URL}/*",* ]]; then
+    MAPS_DEPLOY_ALLOWED_REFERRERS="${MAPS_BASE_ALLOWED_REFERRERS}"
+  else
+    MAPS_DEPLOY_ALLOWED_REFERRERS="${MAPS_BASE_ALLOWED_REFERRERS},${NORMALIZED_SERVICE_URL}/*"
+  fi
+  echo "[deploy-cloud-run] Enforcing API & HTTP referrer restrictions on '${MAPS_BROWSER_KEY_DISPLAY_NAME}' for '${NORMALIZED_SERVICE_URL}/*'..."
+  run_gcloud_redacted "${GCLOUD_BIN}" services api-keys update "${MAPS_BROWSER_KEY_NAME}" \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --api-target=service=maps-backend.googleapis.com \
+    --allowed-referrers="${MAPS_DEPLOY_ALLOWED_REFERRERS}" \
+    --quiet
 fi
 
 echo ""

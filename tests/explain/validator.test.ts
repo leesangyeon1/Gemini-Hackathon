@@ -199,4 +199,90 @@ describe('explain/validator', () => {
       expect(result.errorType).toBe('JSON_PARSE_ERROR');
     }
   });
+
+  it('accepts grounded explanation citing server-computed 40% wide AVM spread ($321,000-$481,000 on $401,000)', () => {
+    const austinProperty: PropertyDetailRecord = {
+      ...property,
+      id: 'prop_austin_48_east_ave_2002',
+      formattedAddress: '48 East Ave, Unit 2002, Austin, TX 78701',
+      city: 'Austin',
+      state: 'TX',
+      zipCode: '78701',
+      propertyType: 'Condo',
+      askingPrice: 505000,
+      avmPrice: 401000,
+      avmLow: 321000,
+      avmHigh: 481000,
+      priceGap: {
+        gapPct: -25.93516209476309,
+        gapAmountUsd: -104000,
+        rangePosition: 'above_estimate_range_candidate',
+        askingPrice: 505000,
+        avmPrice: 401000,
+        avmLow: 321000,
+        avmHigh: 481000,
+        isWithinEstimateRange: false,
+        isProvenUndervaluation: false,
+        interpretationNote: 'Asking price exceeds the upper AVM confidence bound.',
+      },
+      contraryEvidence: [
+        {
+          code: 'wide_avm_uncertainty_band',
+          severity: 'caution',
+          title: 'Wide Valuation Uncertainty Band (40% Spread)',
+          detail:
+            'The AVM confidence range spans $321,000 to $481,000 (40% of midpoint), indicating high local price heterogeneity.',
+        },
+      ],
+    };
+
+    const austinCatalog = buildEvidenceCatalog({
+      property: austinProperty,
+      accessibility: null,
+    });
+
+    const groundedSpreadJson = JSON.stringify({
+      summary:
+        '48 East Ave, Unit 2002 is listed at $505,000 compared with a RentCast AVM midpoint of $401,000 (-25.9% gap, or $104,000 above midpoint), placing the asking price above the [$321,000, $481,000] statistical interval.',
+      evidenceIds: [
+        'ev_prop_pricing',
+        'ev_prop_range',
+        'ev_contrary_wide_avm_uncertainty_band',
+      ],
+      positiveFactors: [],
+      contraryAndUncertaintyFactors: [
+        'The AVM confidence band spans $321,000 to $481,000 ($160,000 width, a 40% spread around the $401,000 midpoint), signaling substantial local comparable dispersion.',
+      ],
+      limitations: [
+        'Automated comparable models do not inspect high-rise floor premiums, view corridors, or interior finishes.',
+      ],
+    });
+
+    const validResult = validateGeminiExplainPayload(
+      groundedSpreadJson,
+      austinCatalog.evidenceCatalog,
+      austinCatalog.facts
+    );
+    expect(validResult.valid).toBe(true);
+
+    // Still rejects an ungrounded percentage on the same property
+    const ungroundedSpreadJson = JSON.stringify({
+      summary:
+        '48 East Ave, Unit 2002 is listed at $505,000 vs AVM $401,000 with a 55% uncertainty spread.',
+      evidenceIds: ['ev_prop_pricing', 'ev_contrary_wide_avm_uncertainty_band'],
+      positiveFactors: [],
+      contraryAndUncertaintyFactors: [],
+      limitations: [],
+    });
+    const invalidResult = validateGeminiExplainPayload(
+      ungroundedSpreadJson,
+      austinCatalog.evidenceCatalog,
+      austinCatalog.facts
+    );
+    expect(invalidResult.valid).toBe(false);
+    if (!invalidResult.valid) {
+      expect(invalidResult.errorType).toBe('NUMERICAL_HALLUCINATION');
+      expect(invalidResult.reason).toContain('55%');
+    }
+  });
 });

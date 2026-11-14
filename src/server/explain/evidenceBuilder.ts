@@ -71,6 +71,31 @@ function formatPercent(pct: number | null | undefined): string {
   return `${sign}${pct.toFixed(1)}%`;
 }
 
+function whitelistServerEvidenceNumbers(text: string, allowedNumbers: Set<number>): void {
+  const dollarRegex = /\$([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g;
+  let dollarMatch: RegExpExecArray | null;
+  while ((dollarMatch = dollarRegex.exec(text)) !== null) {
+    const parsed = Number.parseFloat(dollarMatch[1].replace(/,/g, ''));
+    if (Number.isFinite(parsed)) {
+      allowedNumbers.add(parsed);
+      allowedNumbers.add(Math.round(parsed));
+    }
+  }
+
+  const percentRegex = /([-+]?[0-9]+(?:\.[0-9]+)?)\s*%/g;
+  let percentMatch: RegExpExecArray | null;
+  while ((percentMatch = percentRegex.exec(text)) !== null) {
+    const parsed = Number.parseFloat(percentMatch[1]);
+    if (Number.isFinite(parsed)) {
+      allowedNumbers.add(parsed);
+      allowedNumbers.add(Math.round(parsed));
+      allowedNumbers.add(Number(parsed.toFixed(1)));
+      allowedNumbers.add(Math.abs(parsed));
+      allowedNumbers.add(Math.abs(Number(parsed.toFixed(1))));
+    }
+  }
+}
+
 /**
  * Builds the authoritative, immutable evidence catalog and extracted deterministic facts.
  */
@@ -134,6 +159,24 @@ export function buildEvidenceCatalog(
     allowedNumbers.add(Math.round(gapAmountUsd));
     allowedNumbers.add(Math.abs(gapAmountUsd));
     allowedNumbers.add(Math.abs(Math.round(gapAmountUsd)));
+  }
+  if (
+    typeof avmPrice === 'number' &&
+    Number.isFinite(avmPrice) &&
+    avmPrice > 0 &&
+    typeof avmLow === 'number' &&
+    Number.isFinite(avmLow) &&
+    typeof avmHigh === 'number' &&
+    Number.isFinite(avmHigh) &&
+    avmHigh >= avmLow
+  ) {
+    const avmSpreadUsd = avmHigh - avmLow;
+    const avmSpreadPct = (avmSpreadUsd / avmPrice) * 100;
+    allowedNumbers.add(avmSpreadUsd);
+    allowedNumbers.add(Math.round(avmSpreadUsd));
+    allowedNumbers.add(avmSpreadPct);
+    allowedNumbers.add(Math.round(avmSpreadPct));
+    allowedNumbers.add(Number(avmSpreadPct.toFixed(1)));
   }
 
   // Active Asking Price vs AVM Midpoint
@@ -258,6 +301,7 @@ export function buildEvidenceCatalog(
   // 4. Contrary Evidence & Uncertainty Signals
   // --------------------------------------------------------------------------
   for (const item of property.contraryEvidence ?? []) {
+    whitelistServerEvidenceNumbers(`${item.title} ${item.detail}`, allowedNumbers);
     catalog.push({
       evidenceId: `ev_contrary_${item.code}`,
       sourceId: primaryPropertySource,
