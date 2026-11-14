@@ -354,7 +354,7 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
           }
         }
 
-        sessionStore.recordSearchListings({
+        await sessionStore.recordSearchListingsAsync({
           sessionId: session.sessionId,
           analysisArea,
           listings: enrichedListings,
@@ -463,7 +463,7 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
         }
       }
 
-      sessionStore.recordSearchListings({
+      await sessionStore.recordSearchListingsAsync({
         sessionId: session.sessionId,
         analysisArea,
         listings: enrichedListings,
@@ -537,14 +537,14 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
         clientRequestSeq !== undefined ? { clientRequestSeq } : {};
 
       try {
-        const resolved = sessionStore.getResolvedSessionProperty(
+        const resolved = await sessionStore.getResolvedSessionPropertyAsync(
           sessionId,
           rawPropertyId
         );
 
         let subject: PropertyListingSummary | null = resolved.listing;
 
-        // If subject was not in session memory, reconstruct from validated propertySnapshot if provided
+        // If subject was not in session memory/durable store, reconstruct from validated propertySnapshot if provided
         if (!subject && propertySnapshot) {
           if (
             !isValidCoordinate(
@@ -610,6 +610,21 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
         }
 
         if (!subject) {
+          if (!resolved.sessionExists) {
+            const expiredPayload: ApiErrorResponse = {
+              error: {
+                code: 'SESSION_EXPIRED',
+                message: `Session "${sessionId}" has expired or is no longer available after a server restart or revision rollout. Zero paid RentCast calls were repeated automatically. Please run Analyze Area to start a fresh session or provide propertySnapshot.`,
+                uiState: 'recovery',
+                retryable: false,
+              },
+              budget: await safeGetBudgetSnapshot(budgetStore, sessionId),
+              ...seqField,
+            };
+            res.status(409).json(expiredPayload);
+            return;
+          }
+
           const notFoundPayload: ApiErrorResponse = {
             error: {
               code: 'NOT_FOUND',
@@ -641,7 +656,7 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
             existingDetail.lastSalePrice !== null ||
             existingDetail.assessedValue !== null)
         ) {
-          sessionStore.recordPropertyDetail(sessionId, existingDetail);
+          await sessionStore.recordPropertyDetailAsync(sessionId, existingDetail);
           const budget = await budgetStore.getSnapshot(sessionId);
           const cachedResponse: PropertyAvmResponse = {
             sessionId,
@@ -678,7 +693,7 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
           }
 
           const detail = buildSyntheticAvmForProperty(subject);
-          sessionStore.recordPropertyDetail(sessionId, detail);
+          await sessionStore.recordPropertyDetailAsync(sessionId, detail);
           sessionStore.setCachedAvmDetail(cacheKey, detail);
           const budget = await budgetStore.getSnapshot(sessionId);
 
@@ -755,7 +770,10 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
               rawPropertyRecordPayload: rawPropRecord,
             });
 
-            sessionStore.recordPropertyDetail(sessionId, normalizedDetail);
+            await sessionStore.recordPropertyDetailAsync(
+              sessionId,
+              normalizedDetail
+            );
             sessionStore.setCachedAvmDetail(cacheKey, normalizedDetail);
 
             return { detail: normalizedDetail, budget: latestBudget };
@@ -813,7 +831,22 @@ export function createPropertyRouters(deps: PropertyRouterDependencies): {
       const { userConfirmed, clientRequestSeq } = bodyParse.data;
 
       try {
-        sessionStore.ensureSession(sessionId);
+        const hydratedSession = await sessionStore.getSessionAsync(sessionId);
+        if (!hydratedSession) {
+          const expiredPayload: ApiErrorResponse = {
+            error: {
+              code: 'SESSION_EXPIRED',
+              message: `Session "${sessionId}" has expired or is no longer available after a server restart or revision rollout. Zero paid RentCast calls were repeated automatically. Please run Analyze Area to start a fresh session.`,
+              uiState: 'recovery',
+              retryable: false,
+            },
+            budget: await safeGetBudgetSnapshot(budgetStore, sessionId),
+            ...(clientRequestSeq !== undefined ? { clientRequestSeq } : {}),
+          };
+          res.status(409).json(expiredPayload);
+          return;
+        }
+
         const budget = await budgetStore.expandSession(sessionId, userConfirmed);
 
         const responsePayload: SessionExpandResponse = {

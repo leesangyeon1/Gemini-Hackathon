@@ -94,9 +94,11 @@ Because RentCast's Developer free tier allows **50 calls/month account-wide** be
 1. **Global Monthly Ceiling (`< 50`):**
    - Configured via `RENTCAST_GLOBAL_MONTHLY_LIMIT` (clamped to `1..49`, default `35`) and `RENTCAST_INITIAL_SPENT_CALLS` (`>= 0`, default `0`).
    - Effective runtime allowance for the current `YYYY-MM` UTC month is $\max(0, L_{\text{config}} - S_{\text{initial}} - S_{\text{runtime}})$.
-2. **Cloud Run Production (`BUDGET_STORE_MODE=firestore`):**
-   - Uses Google Cloud Firestore REST/atomic transactional commit (`projects/{GOOGLE_CLOUD_PROJECT}/databases/(default)/documents/rentcast_budget/{YYYY_MM}`) authenticated via Cloud Run's attached service-account metadata token (zero extra native C++ dependencies).
-   - Atomically checks and increments `runtimeSpentCalls` and session counters under optimistic concurrency preconditions, preventing multi-instance races (`--max-instances=2`).
+2. **Cloud Run Production (`BUDGET_STORE_MODE=firestore`, auto-defaulted when `K_SERVICE` is set):**
+   - Uses Google Cloud Firestore REST/atomic transactional commit (`projects/{GOOGLE_CLOUD_PROJECT}/databases/(default)/documents/rentcast_budget/{YYYY-MM}`) authenticated via Cloud Run's attached service-account metadata token with TTL caching and optimistic-concurrency retry.
+   - **Durable Session Persistence Across Restarts & Revisions:** Resolved session `AnalysisArea`, listings, and fetched AVM details are also persisted in Firestore (`foreal_sessions/{sessionId}`, 24h TTL) and hydrated on cache miss—because `--session-affinity` is best-effort and `--max-instances=1` neither guarantees persistent in-memory state across cold starts/revision rollouts nor acts as a monthly dollar spending cap.
+   - **Explicit Safe Session-Expiry Recovery (`409 SESSION_EXPIRED`):** If a session expires past its TTL or is absent from both memory and durable storage, `/api/explain` and session-bound endpoints return `409 SESSION_EXPIRED` (`uiState: "recovery"`) without ever silently repeating paid RentCast calls.
+   - **External Key Consumers:** Firestore's counter tracks Foreal-Estate usage plus configured `RENTCAST_INITIAL_SPENT_CALLS`; it cannot automatically observe unrelated external scripts sharing the same RentCast API key.
    - **Fails closed:** If Firestore is unreachable when `BUDGET_STORE_MODE=firestore`, no upstream RentCast call is dispatched.
 3. **Local Development (`BUDGET_STORE_MODE=sqlite`):**
    - Uses Node v24's built-in `node:sqlite` (`DatabaseSync`) persisted at `SQLITE_BUDGET_PATH` (default `.data/rentcast-budget.sqlite`) with `BEGIN IMMEDIATE` transactions so budget state survives `tsx` reloads and server restarts without `node-gyp`.

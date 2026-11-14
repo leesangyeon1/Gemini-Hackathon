@@ -91,14 +91,29 @@ Additional protections:
 - **Cache Deduplication before Budget Deduction:** Normalized region searches and `propertyId` AVM lookups check the server cache first. Cache hits return immediately with **0 provider calls** spent.
 - **In-Flight Request Coalescing & Concurrency Cap:** Concurrent identical requests for the same `propertyId` or region share a single in-flight promise, and upstream RentCast concurrency is capped at **2 concurrent requests** with per-client rate limiting.
 
-### 5.3 Multi-Instance & Container-Restart Durability
+### 5.3 Multi-Instance & Container-Restart Durability (Budget + Session State)
 
-| Environment (`BUDGET_STORE_MODE`) | Backing Store | Atomic Reservation Mechanism | Restart & Multi-Instance Behavior |
+| Environment (`BUDGET_STORE_MODE`) | Backing Store (Budget + Sessions) | Atomic Reservation & Session Hydration | Restart & Multi-Instance Behavior |
 |---|---|---|---|
-| **Production (`firestore`)** | Google Cloud Firestore (`projects/$GOOGLE_CLOUD_PROJECT/databases/(default)/documents/rentcast_budget/$YYYY_MM`) | Firestore atomic `commit` / `runTransaction` with precondition on current `runtimeSpentCalls` | Survives Cloud Run scale-to-zero, container restarts, and multi-instance concurrency (`--max-instances=2`) |
-| **Local Dev (`sqlite`)** | Built-in Node.js v24 `node:sqlite` (`DatabaseSync` persisted to `.data/rentcast-budget.sqlite`) | `BEGIN IMMEDIATE` transaction checking and incrementing `runtime_spent_calls` + `sessions` table | Survives local dev server restarts (`tsx` / `npm start`) without native `node-gyp` dependencies |
+| **Production (`firestore`)** | Google Cloud Firestore (`rentcast_budget/$YYYY_MM` for budget; `foreal_sessions/$sessionId` with 24h TTL for resolved listings/AVM details) | Firestore atomic `documents:commit` with `currentDocument.updateTime` precondition + 4-attempt optimistic concurrency retry; async session hydration on memory-cache miss | Survives Cloud Run scale-to-zero, container restarts, and revision rollouts (`--max-instances=1 --session-affinity`) without repeating paid RentCast calls |
+| **Local Dev (`sqlite`)** | Built-in Node.js v24 `node:sqlite` (`DatabaseSync` persisted to `.data/rentcast-budget.sqlite` with `rentcast_monthly_budget`, `rentcast_session_budget`, and `foreal_property_sessions` tables) | `BEGIN IMMEDIATE` transaction checking and incrementing `runtime_spent_calls` + 24h TTL session hydration on memory-cache miss | Survives local dev server restarts (`tsx` / `npm start`) without native `node-gyp` dependencies |
 
-**Fail-Closed Guarantee:** If `BUDGET_STORE_MODE=firestore` is configured in production and Firestore fails or rejects the transaction, the budget manager **fails closed** (refuses to call RentCast and returns a structured `quota_exhausted` / `budget_store_error` status while allowing cached results and opt-in badged `synthetic_demo` mode).
+**Fail-Closed Guarantee & Safe Session-Expiry Recovery (`409 SESSION_EXPIRED`):**
+- If `BUDGET_STORE_MODE=firestore` is configured in production and Firestore fails or rejects the transaction, the budget manager **fails closed** (refuses to call RentCast and returns HTTP `503 BUDGET_STORE_UNAVAILABLE` with `uiState: "quota_exhausted"` while allowing cached results and opt-in badged `synthetic_demo` mode).
+- If a session genuinely expires after its 24-hour TTL (or is missing across an unbacked restart) and cannot be safely recovered without repeating paid calls, `POST /api/properties/:propertyId/avm` (when no `propertySnapshot` is supplied), `POST /api/sessions/:sessionId/expand`, and `POST /api/explain` return HTTP **`409 SESSION_EXPIRED`** (`uiState: "recovery"`, `retryable: false`) and **never silently repeat paid `/v1/listings/sale` or `/v1/avm/value` requests**.
+
+### 5.4 RentCast Account Usage vs. Application Counter Reconciliation
+
+Because a RentCast API key is scoped to the developer account at `https://app.rentcast.io/app/api`, **neither Firestore's `rentcast_budget/${YYYY-MM}` document nor local SQLite can automatically observe external consumers** (e.g., manual `curl` tests, separate staging environments, or other tools) sharing the same `RENTCAST_API_KEY`.
+
+To prevent external calls from causing the combined account usage to exceed the 50-call monthly free tier:
+1. **Dedicated Key Policy:** Use a dedicated RentCast API key exclusively for this deployment whenever possible.
+2. **Pre-Deploy & Periodic Reconciliation Procedure:**
+   - Check the current billing-month usage count $U_{\text{dashboard}}$ on the official RentCast API dashboard (`https://app.rentcast.io/app/api`).
+   - Query the application's recorded runtime spend $S_{\text{runtime}}$ from `GET /api/config` (`budget.runtimeSpentCalls`) or directly from Firestore document `rentcast_budget/${YYYY-MM}` (`fields.runtimeSpentCalls.integerValue`).
+   - Set `RENTCAST_INITIAL_SPENT_CALLS` to at least the externally consumed difference:
+     $$\text{RENTCAST\_INITIAL\_SPENT\_CALLS} = \max\left(0,\, U_{\text{dashboard}} - S_{\text{runtime}}\right)$$
+   - Keep `RENTCAST_GLOBAL_MONTHLY_LIMIT=35` (leaving a 15-call safety buffer below the 50-call free tier). Since the budget store enforces $S_{\text{initial}} + S_{\text{runtime}} \le L_{\text{config}}$ on every reservation, updating `RENTCAST_INITIAL_SPENT_CALLS` immediately tightens the remaining runtime ceiling without resetting `runtimeSpentCalls`.
 
 ---
 

@@ -44,6 +44,7 @@ import {
   candidateToAnalysisArea,
   clonePreferences,
   createClientDefaultPreferences,
+  formatIsoDate,
   getActiveCategories,
 } from './utils/formatters';
 
@@ -83,6 +84,7 @@ export const App: React.FC = () => {
 
   // Area analysis, geospatial & property listings state
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionExpiredMessage, setSessionExpiredMessage] = useState<string | null>(null);
   const [budget, setBudget] = useState<BudgetSnapshot | null>(null);
   const [geospatialData, setGeospatialData] = useState<GeospatialAnalyzeResponse | null>(null);
   const [listings, setListings] = useState<PropertyListingSummary[]>([]);
@@ -165,6 +167,7 @@ export const App: React.FC = () => {
     explainAbortRef.current?.abort();
 
     setUseSyntheticDemo(enabled);
+    setSessionExpiredMessage(null);
     setGeospatialData(null);
     setListings([]);
     setSelectedPropertyId(null);
@@ -298,6 +301,7 @@ export const App: React.FC = () => {
     analyzeSeqRef.current = seq;
 
     setIsAnalyzing(true);
+    setSessionExpiredMessage(null);
     setAreaUiState('loading');
     setAreaError(null);
     setAvmError(null);
@@ -517,6 +521,16 @@ export const App: React.FC = () => {
     setMobileTab('detail');
   };
 
+  const triggerSessionExpiredRecovery = (serverMessage?: string) => {
+    const detail = serverMessage ? ` (${serverMessage})` : '';
+    const notice =
+      `Your server session expired after an idle, restart, or revision window${detail}. ` +
+      'Existing listings, map overlays, and AVM values are preserved, and zero paid RentCast calls were repeated automatically. ' +
+      'Click Analyze Area explicitly if you want to start a fresh session.';
+    setSessionExpiredMessage(notice);
+    setLiveAnnouncement(notice);
+  };
+
   const handleFetchAvm = async (propertyId: string) => {
     const activeListing = listings.find((l) => l.id === propertyId);
     const activeSessionId = sessionId ?? 'sess_demo_local';
@@ -596,6 +610,13 @@ export const App: React.FC = () => {
       if (apiErr?.budget) {
         setBudget(apiErr.budget);
       }
+      if (apiErr?.code === 'SESSION_EXPIRED' || apiErr?.status === 409) {
+        triggerSessionExpiredRecovery(apiErr.message);
+        setAvmError(
+          'Server session expired. Existing data is preserved and zero RentCast calls were repeated automatically.'
+        );
+        return;
+      }
       setAvmError(apiErr?.message ?? 'Unable to fetch RentCast AVM for this property.');
     } finally {
       if (seq === avmSeqRef.current && selectedPropertyIdRef.current === propertyId) {
@@ -617,6 +638,10 @@ export const App: React.FC = () => {
       setLiveAnnouncement(res.message);
     } catch (err) {
       const apiErr = err instanceof ApiClientError ? err : null;
+      if (apiErr?.code === 'SESSION_EXPIRED' || apiErr?.status === 409) {
+        triggerSessionExpiredRecovery(apiErr.message);
+        return;
+      }
       setAreaError({
         message: apiErr?.message ?? 'Failed to expand session AVM allowance.',
         retryable: false,
@@ -678,6 +703,13 @@ export const App: React.FC = () => {
         return;
       }
       const apiErr = err instanceof ApiClientError ? err : null;
+      if (apiErr?.code === 'SESSION_EXPIRED' || apiErr?.status === 409) {
+        triggerSessionExpiredRecovery(apiErr.message);
+        setExplainError(
+          'Server session expired. Existing data is preserved and zero RentCast calls were repeated automatically.'
+        );
+        return;
+      }
       setExplainError(apiErr?.message ?? 'Failed to generate explanation.');
     } finally {
       if (seq === explainSeqRef.current && selectedPropertyIdRef.current === propertyId) {
@@ -733,6 +765,42 @@ export const App: React.FC = () => {
           onToggleSyntheticDemo={handleToggleSyntheticDemo}
           onRetryConfig={() => void loadConfig()}
         />
+
+        {sessionExpiredMessage && (
+          <section
+            className="banner banner-session-expired"
+            role="alert"
+            aria-live="assertive"
+            data-testid="session-expired-banner"
+          >
+            <div className="banner-content">
+              <div className="banner-heading">
+                <span className="pill pill-session-expired">Session Expired (409)</span>
+                <strong>Session-Expiry Recovery — Context Preserved</strong>
+              </div>
+              <p className="muted-sm">{sessionExpiredMessage}</p>
+            </div>
+            <div className="banner-actions">
+              {confirmedArea && (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={handleAnalyzeArea}
+                  disabled={isAnalyzing}
+                >
+                  Analyze Area (Start Fresh Session)
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setSessionExpiredMessage(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          </section>
+        )}
 
         <div className="top-workspace-row">
           <RegionSearchBar
@@ -809,6 +877,17 @@ export const App: React.FC = () => {
             <AccessibleLegends
               activeCategoryCount={activeCategoryCount}
               maxObservedOverlap={geospatialData?.gridOverlap.maxOverlapCount ?? 0}
+              sourceDates={{
+                osmOverpass: geospatialData ? formatIsoDate(geospatialData.fetchedAt) : null,
+                epaFrs: geospatialData ? formatIsoDate(geospatialData.fetchedAt) : null,
+                googlePlaces:
+                  geospatialData && geospatialData.displayOnlyPlacesContext.length > 0
+                    ? formatIsoDate(geospatialData.fetchedAt)
+                    : null,
+                rentCastAvm: selectedProperty?.avmFetchedAt
+                  ? formatIsoDate(selectedProperty.avmFetchedAt)
+                  : null,
+              }}
             />
           </div>
 

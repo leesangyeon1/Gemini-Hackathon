@@ -15,7 +15,7 @@ import {
 import type { ApiErrorResponse } from '../../shared/types';
 import type { ServerConfig } from '../config';
 import { redactSecretsFromText } from '../config';
-import type { ExplainService } from './explainService';
+import { SessionExpiredError, type ExplainService } from './explainService';
 
 export interface CreateExplainRouterOptions {
   readonly config: ServerConfig;
@@ -75,6 +75,32 @@ export function createExplainRouter(options: CreateExplainRouterOptions): Router
       const verifiedResponse = ExplainResponseSchema.parse(explainResult);
       res.status(200).json(verifiedResponse);
     } catch (err) {
+      if (
+        err instanceof SessionExpiredError ||
+        (err && typeof err === 'object' && 'code' in err && (err as { code?: unknown }).code === 'SESSION_EXPIRED')
+      ) {
+        const rawMessage =
+          err instanceof Error
+            ? err.message
+            : 'Session has expired due to inactivity or server revision restart.';
+        const safeMessage = redactSecretsFromText(rawMessage, config);
+
+        const sessionExpiredResponse: ApiErrorResponse = {
+          error: {
+            code: 'SESSION_EXPIRED',
+            message: safeMessage,
+            uiState: 'recovery',
+            retryable: false,
+          },
+          budget: null,
+          ...(validRequest.clientRequestSeq !== undefined
+            ? { clientRequestSeq: validRequest.clientRequestSeq }
+            : {}),
+        };
+        res.status(409).json(sessionExpiredResponse);
+        return;
+      }
+
       const rawMessage = err instanceof Error ? err.message : 'Failed to generate explanation.';
       const safeMessage = redactSecretsFromText(rawMessage, config);
 

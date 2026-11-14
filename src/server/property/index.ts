@@ -1,7 +1,7 @@
 /**
  * Property, Region Resolution & Durable Budget Module Barrel (`src/server/property/index.ts`)
  *
- * Exports `createPropertyModule(config, deps?)` for Stage 3 app wiring in `src/server/app.ts`
+ * Exports `createPropertyModule(config, deps?)` for Stage 3/Phase 5 app wiring in `src/server/app.ts`
  * as well as all underlying stores, resolvers, and normalizers.
  */
 
@@ -41,7 +41,9 @@ import {
 } from './rentcastClient';
 import { createPropertyRouters } from './router';
 import {
+  DEFAULT_SESSION_TTL_MS,
   type PropertySessionStore,
+  type PropertySessionStoreOptions,
   type ResolvedSessionPropertyLookup,
   buildSearchCacheKey,
   createPropertySessionStore,
@@ -60,6 +62,7 @@ export interface CreatePropertyModuleDependencies {
   readonly rentcastClient?: RentCastClient;
   readonly rentcastClientOptions?: Partial<RentCastClientOptions>;
   readonly sessionStore?: PropertySessionStore;
+  readonly sessionStoreOptions?: Partial<PropertySessionStoreOptions>;
   readonly fetchFn?: typeof fetch;
   readonly scorePropertyPoint?: (params: {
     analysisArea: AnalysisArea | null;
@@ -88,13 +91,17 @@ export interface PropertyModule {
     sessionId: string,
     propertyId: string
   ): ResolvedSessionPropertyLookup;
+  getResolvedSessionPropertyAsync(
+    sessionId: string,
+    propertyId: string
+  ): Promise<ResolvedSessionPropertyLookup>;
 }
 
 export function createPropertyModule(
   config: ServerConfig,
   deps: CreatePropertyModuleDependencies = {}
 ): PropertyModule {
-  const budgetStore =
+  const rawBudgetStore =
     deps.budgetStore ??
     createBudgetStore({
       mode: config.budgetStoreMode,
@@ -123,7 +130,31 @@ export function createPropertyModule(
       ...deps.rentcastClientOptions,
     });
 
-  const sessionStore = deps.sessionStore ?? createPropertySessionStore();
+  const sessionStore =
+    deps.sessionStore ??
+    createPropertySessionStore({
+      mode: deps.budgetStoreOptions?.mode ?? config.budgetStoreMode,
+      sqlitePath:
+        deps.budgetStoreOptions?.sqlitePath ?? config.sqliteBudgetPath,
+      googleCloudProject:
+        deps.budgetStoreOptions?.googleCloudProject !== undefined
+          ? deps.budgetStoreOptions.googleCloudProject
+          : config.googleCloudProject,
+      firestoreAccessTokenProvider:
+        deps.budgetStoreOptions?.firestoreAccessTokenProvider,
+      fetchFn: deps.fetchFn ?? deps.budgetStoreOptions?.fetchFn,
+      nowFn: deps.budgetStoreOptions?.nowFn,
+      ...deps.sessionStoreOptions,
+    });
+
+  const originalClose = rawBudgetStore.close?.bind(rawBudgetStore);
+  const budgetStore: BudgetStore = {
+    ...rawBudgetStore,
+    close(): void {
+      sessionStore.close();
+      originalClose?.();
+    },
+  };
 
   const routers = createPropertyRouters({
     config,
@@ -147,6 +178,12 @@ export function createPropertyModule(
       propertyId: string
     ): ResolvedSessionPropertyLookup {
       return sessionStore.getResolvedSessionProperty(sessionId, propertyId);
+    },
+    async getResolvedSessionPropertyAsync(
+      sessionId: string,
+      propertyId: string
+    ): Promise<ResolvedSessionPropertyLookup> {
+      return sessionStore.getResolvedSessionPropertyAsync(sessionId, propertyId);
     },
   };
 }
@@ -174,10 +211,12 @@ export {
   type RentCastClient,
   type RentCastClientOptions,
   createPropertyRouters,
+  DEFAULT_SESSION_TTL_MS,
   buildSearchCacheKey,
   createPropertySessionStore,
   generateSessionId,
   type PropertySessionStore,
+  type PropertySessionStoreOptions,
   type ResolvedSessionPropertyLookup,
   buildSyntheticAvmForProperty,
   buildSyntheticListingsForArea,

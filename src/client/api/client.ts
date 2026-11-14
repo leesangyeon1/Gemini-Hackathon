@@ -72,6 +72,8 @@ function mapCodeToUiState(code: ApiErrorCode): UiState {
       return 'quota_exhausted';
     case 'UPSTREAM_TIMEOUT':
       return 'timeout';
+    case 'SESSION_EXPIRED':
+      return 'recovery';
     case 'NOT_FOUND':
       return 'empty';
     default:

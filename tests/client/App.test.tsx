@@ -571,4 +571,171 @@ describe('Foreal-Estate Client UI', () => {
     fireEvent.click(screen.getByTestId('fetch-avm-button'));
     await screen.findByText(/Session AVM cap \(5\/5\) reached/i);
   });
+
+  it('preserves listings, map overlays, and AVM values on 409 SESSION_EXPIRED from /api/explain with zero automatic property retries', async () => {
+    let propertyEndpointCalls = 0;
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.startsWith('/api/properties/')) {
+        propertyEndpointCalls += 1;
+      }
+      if (url === '/api/config') {
+        return jsonResponse(makeSetupNeededConfig({ missingSetupEnvVars: [] }));
+      }
+      if (url === '/api/regions/resolve') {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        return jsonResponse(makeResolveResponse({ clientRequestSeq: body.clientRequestSeq }));
+      }
+      if (url === '/api/geospatial/analyze') {
+        return jsonResponse(makeAustinGeospatialResponse(AUSTIN_AREA, false));
+      }
+      if (url === '/api/properties/search') {
+        return jsonResponse(makeAustinSearchResponse(AUSTIN_AREA, false));
+      }
+      if (url === '/api/properties/prop-austin-1/avm') {
+        return jsonResponse(makeAustinAvmResponse());
+      }
+      if (url === '/api/explain') {
+        return jsonResponse(
+          {
+            error: {
+              code: 'SESSION_EXPIRED',
+              message: 'Session sess_austin_001 is no longer present on this server instance.',
+              uiState: 'recovery',
+              retryable: false,
+            },
+            budget: null,
+          },
+          409
+        );
+      }
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await screen.findByLabelText(/US City, Neighborhood, or ZIP/i);
+
+    fireEvent.change(screen.getByLabelText(/US City, Neighborhood, or ZIP/i), {
+      target: { value: 'Austin, TX' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Resolve Location/i }));
+    await screen.findByTestId('confirmed-area-box');
+    fireEvent.click(screen.getByTestId('analyze-area-button'));
+
+    await screen.findByTestId('property-card-prop-austin-1');
+    fireEvent.click(screen.getByTestId('property-card-prop-austin-1'));
+    fireEvent.click(screen.getByTestId('fetch-avm-button'));
+    await waitFor(() => {
+      expect(screen.getByTestId('detail-avm-price')).toHaveTextContent('$1,000,000');
+    });
+
+    const propertyCallsBeforeExplain = propertyEndpointCalls;
+    expect(propertyCallsBeforeExplain).toBe(2); // 1 search + 1 AVM
+
+    // Trigger /api/explain -> 409 SESSION_EXPIRED
+    fireEvent.click(screen.getByTestId('generate-explain-button'));
+
+    const expiredBanner = await screen.findByTestId('session-expired-banner');
+    expect(expiredBanner).toHaveTextContent('Session Expired (409)');
+    expect(expiredBanner).toHaveTextContent(
+      'zero paid RentCast calls were repeated automatically'
+    );
+    expect(expiredBanner).toHaveTextContent('Click Analyze Area explicitly');
+
+    // Listings, map center score, and AVM values remain intact
+    expect(screen.getByTestId('property-card-prop-austin-1')).toBeInTheDocument();
+    expect(screen.getByTestId('center-accessibility-summary')).toHaveTextContent('78.5 / 100');
+    expect(screen.getByTestId('detail-avm-price')).toHaveTextContent('$1,000,000');
+
+    // Wait briefly and assert 0 additional /api/properties/* calls were fired
+    await new Promise((r) => setTimeout(r, 30));
+    expect(propertyEndpointCalls).toBe(propertyCallsBeforeExplain);
+  });
+
+  it('renders AI Studio ARIA disclosure controls, keyboard navigation, and source-attribution badges in AccessibleLegends', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === '/api/config') {
+        return jsonResponse(makeSetupNeededConfig({ missingSetupEnvVars: [] }));
+      }
+      if (url === '/api/regions/resolve') {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        return jsonResponse(makeResolveResponse({ clientRequestSeq: body.clientRequestSeq }));
+      }
+      if (url === '/api/geospatial/analyze') {
+        return jsonResponse(makeAustinGeospatialResponse(AUSTIN_AREA, false));
+      }
+      if (url === '/api/properties/search') {
+        return jsonResponse(makeAustinSearchResponse(AUSTIN_AREA, false));
+      }
+      if (url === '/api/properties/prop-austin-1/avm') {
+        return jsonResponse(makeAustinAvmResponse());
+      }
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await screen.findByTestId('legend-accessibility');
+
+    const accToggle = screen.getByRole('button', {
+      name: /1\. Facility Accessibility & Overlap Legend/i,
+    });
+    const gapToggle = screen.getByRole('button', {
+      name: /2\. Asking-vs-AVM Price Gap & Range Legend/i,
+    });
+
+    expect(accToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(accToggle).toHaveAttribute('aria-controls', 'legend-accessibility-panel');
+    expect(gapToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(gapToggle).toHaveAttribute('aria-controls', 'legend-price-gap-panel');
+
+    // Source attribution badges present
+    expect(screen.getByTestId('source-badge-osm-overpass')).toHaveTextContent(
+      'OpenStreetMap & Overpass API (ODbL 1.0)'
+    );
+    expect(screen.getByTestId('source-badge-epa-frs')).toHaveTextContent(
+      'US EPA FRS / Envirofacts'
+    );
+    expect(screen.getByTestId('source-badge-google-places')).toHaveTextContent(
+      'Excluded from Scoring & AI evidence'
+    );
+    expect(screen.getByTestId('source-badge-rentcast-avm')).toHaveTextContent('RentCast AVM');
+
+    // Keyboard arrow navigation moves focus between legend disclosure buttons
+    accToggle.focus();
+    fireEvent.keyDown(accToggle, { key: 'ArrowDown' });
+    expect(gapToggle).toHaveFocus();
+    fireEvent.keyDown(gapToggle, { key: 'Home' });
+    expect(accToggle).toHaveFocus();
+
+    // Disclosure toggles collapse/expand panel cleanly
+    fireEvent.click(accToggle);
+    expect(accToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(document.getElementById('legend-accessibility-panel')).toHaveAttribute('hidden');
+    fireEvent.click(accToggle);
+    expect(accToggle).toHaveAttribute('aria-expanded', 'true');
+
+    // Load area + AVM and confirm source date badges update with real fetched dates
+    fireEvent.change(screen.getByLabelText(/US City, Neighborhood, or ZIP/i), {
+      target: { value: 'Austin, TX' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Resolve Location/i }));
+    await screen.findByTestId('confirmed-area-box');
+    fireEvent.click(screen.getByTestId('analyze-area-button'));
+    await screen.findByTestId('property-card-prop-austin-1');
+    fireEvent.click(screen.getByTestId('property-card-prop-austin-1'));
+    fireEvent.click(screen.getByTestId('fetch-avm-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('source-badge-osm-overpass')).toHaveTextContent(
+        'Date: Nov 14, 2026'
+      );
+      expect(screen.getByTestId('source-badge-rentcast-avm')).toHaveTextContent(
+        'Date: Nov 14, 2026'
+      );
+    });
+  });
 });

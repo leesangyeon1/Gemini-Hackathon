@@ -31,6 +31,17 @@ import { buildEvidenceCatalog, type DeterministicFacts } from './evidenceBuilder
 import { buildExplainPrompt } from './promptBuilder';
 import { validateGeminiExplainPayload } from './validator';
 
+export class SessionExpiredError extends Error {
+  public readonly code = 'SESSION_EXPIRED' as const;
+  public readonly statusCode = 409 as const;
+
+  constructor(message = 'Session has expired due to inactivity or server revision restart.') {
+    super(message);
+    this.name = 'SessionExpiredError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 export interface PropertyContextResolution {
   readonly property: PropertyDetailRecord;
   readonly accessibility: AccessibilityResult | null;

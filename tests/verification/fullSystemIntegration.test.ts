@@ -1356,6 +1356,7 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
         'Dockerfile',
         'scripts/deploy-cloud-run.sh',
         'scripts/provision-gcp-resources.sh',
+        'scripts/verify-live-providers.mjs',
         'dist/client/index.html',
         'dist/server/index.js',
         'docs/SWARM-PLAN.md',
@@ -1487,9 +1488,10 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
       }
       expect(overCapFailedClosed).toBe(true);
 
-      // Verify honest PENDING AI Studio status and BLOCKED / NOT DEPLOYED Cloud Run status
+      // Verify honest EXECUTED & EXPORTED AI Studio status and BLOCKED / NOT DEPLOYED Cloud Run status
       const handoffDoc = fs.readFileSync(path.join(REPO_ROOT, 'docs/AI_STUDIO_HANDOFF.md'), 'utf8');
-      expect(handoffDoc).toContain('PENDING');
+      expect(handoffDoc).toContain('EXECUTED & EXPORTED');
+      expect(handoffDoc).toContain('gemini-4-hydrogen');
       // AUDIT-08: AI_STUDIO_HANDOFF.md shared contract snapshot must match src/shared/types.ts
       for (const state of UI_STATES) {
         expect(handoffDoc, `AI_STUDIO_HANDOFF.md missing UiState "${state}"`).toContain(`'${state}'`);
@@ -1609,20 +1611,32 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
         'utf8'
       );
       expect(deployScriptText).toContain('BUDGET_STORE_MODE=firestore');
+      expect(deployScriptText).toContain('CLOUD_RUN_REGION="${CLOUD_RUN_REGION:-us-west1}"');
       expect(deployScriptText).toContain('--port=8080');
       expect(deployScriptText).toContain('CLOUD_RUN_MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-1}"');
       expect(deployScriptText).toContain('--min-instances=');
       expect(deployScriptText).toContain('--max-instances=');
       expect(deployScriptText).toContain('--session-affinity');
+      expect(deployScriptText).toContain('state=ENABLED');
+      expect(deployScriptText).toContain('~createTime');
       expect(deployScriptText).toContain('RENTCAST_API_KEY=');
       expect(deployScriptText).toContain('GEMINI_API_KEY=');
 
       const provisionScriptPath = path.join(REPO_ROOT, 'scripts/provision-gcp-resources.sh');
       const provisionScriptText = fs.readFileSync(provisionScriptPath, 'utf8');
-      expect(provisionScriptText).toContain('gcloud secrets add-iam-policy-binding');
+      expect(provisionScriptText).toContain('CLOUD_RUN_REGION="${CLOUD_RUN_REGION:-us-west1}"');
+      expect(provisionScriptText).toContain('secrets add-iam-policy-binding');
       expect(provisionScriptText).toContain('read -r -s');
       expect(provisionScriptText).toContain('--data-file=-');
       execFileSync('bash', ['-n', provisionScriptPath], { stdio: 'pipe' });
+      execFileSync('bash', ['-n', path.join(REPO_ROOT, 'scripts/deploy-cloud-run.sh')], {
+        stdio: 'pipe',
+      });
+      execFileSync(
+        process.execPath,
+        ['--check', path.join(REPO_ROOT, 'scripts/verify-live-providers.mjs')],
+        { stdio: 'pipe' }
+      );
 
       let provisionUnsetFailedClosed = false;
       try {
@@ -1635,23 +1649,92 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
       }
       expect(provisionUnsetFailedClosed).toBe(true);
 
-      // 5. Simulate 2 separate Cloud Run container instances sharing durable SQLite/Firestore budget storage
-      //    but having isolated process-local PropertySessionStore maps.
+      // 6. Simulate 2 separate Cloud Run container instances sharing durable SQLite/Firestore storage:
+      //    Verify Instance B durably hydrates sessions on /api/explain and /api/properties/:id/avm with 0 repeated RentCast calls,
+      //    missing/expired sessions return 409 SESSION_EXPIRED (0 repeated RentCast calls),
+      //    and unknown propertyIds on an active session still return 404 NOT_FOUND.
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'foreal-cr-multi-'));
       const sharedSqlitePath = path.join(tmpDir, 'shared-durable-budget.sqlite');
       try {
+        let rentcastListingsCalls = 0;
+        let rentcastAvmCalls = 0;
+
+        const liveMockFetch: typeof fetch = async (input) => {
+          const url =
+            typeof input === 'string'
+              ? input
+              : input instanceof URL
+                ? input.toString()
+                : input.url;
+          if (url.includes('api.rentcast.io/v1/listings/sale')) {
+            rentcastListingsCalls += 1;
+            return jsonResponse([
+              {
+                id: 'rc-sea-durable-1',
+                formattedAddress: '2101 N 34th St, Seattle, WA 98103',
+                city: 'Seattle',
+                state: 'WA',
+                zipCode: '98103',
+                latitude: 47.6485,
+                longitude: -122.3331,
+                propertyType: 'Single Family',
+                bedrooms: 3,
+                bathrooms: 2,
+                squareFootage: 1950,
+                price: 900_000,
+                lastSeenDate: '2026-11-14T00:00:00.000Z',
+              },
+            ]);
+          }
+          if (url.includes('api.rentcast.io/v1/avm/value')) {
+            rentcastAvmCalls += 1;
+            return jsonResponse({
+              price: 1_000_000,
+              priceRangeLow: 850_000,
+              priceRangeHigh: 1_150_000,
+              comparables: [],
+            });
+          }
+          if (url.includes('overpass')) {
+            return jsonResponse({
+              elements: [
+                {
+                  type: 'node',
+                  id: 777,
+                  lat: 47.649,
+                  lon: -122.334,
+                  tags: { leisure: 'park', name: 'Gas Works Park' },
+                },
+              ],
+            });
+          }
+          if (url.includes('ofmpub.epa.gov')) {
+            return jsonResponse({ Results: { FRSFacility: [] } });
+          }
+          return jsonResponse({}, 404);
+        };
+
         const instanceConfig = loadServerConfig({
           NODE_ENV: 'production',
           BUDGET_STORE_MODE: 'sqlite',
           SQLITE_BUDGET_PATH: sharedSqlitePath,
-          ENABLE_SYNTHETIC_DEMO_MODE: 'true',
+          RENTCAST_API_KEY: 'rc_durable_session_test_key',
           RENTCAST_GLOBAL_MONTHLY_LIMIT: '35',
         });
 
-        const propA = createPropertyModule(instanceConfig);
-        const instanceA = createApp({ config: instanceConfig, propertyModule: propA });
-        const propB = createPropertyModule(instanceConfig);
-        const instanceB = createApp({ config: instanceConfig, propertyModule: propB });
+        const propA = createPropertyModule(instanceConfig, { fetchFn: liveMockFetch });
+        const instanceA = createApp({
+          config: instanceConfig,
+          propertyModule: propA,
+          geospatialOptions: { fetchImpl: liveMockFetch },
+        });
+
+        const propB = createPropertyModule(instanceConfig, { fetchFn: liveMockFetch });
+        const instanceB = createApp({
+          config: instanceConfig,
+          propertyModule: propB,
+          geospatialOptions: { fetchImpl: liveMockFetch },
+        });
 
         try {
           const resolveRes = await invokeExpressApp(instanceA, {
@@ -1659,7 +1742,6 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
             url: '/api/regions/resolve',
             body: {
               query: 'Seattle, WA',
-              useSyntheticDemo: true,
               clientRequestSeq: 1,
             },
           });
@@ -1667,93 +1749,116 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
           const searchArea = resolveRes.body.selectedArea;
           expect(searchArea).toBeDefined();
 
-          // Step A: Search lands on Cloud Run Instance A
+          // Step A: Search lands on Cloud Run Instance A (1 paid listings call)
           const searchRes = await invokeExpressApp(instanceA, {
             method: 'POST',
             url: '/api/properties/search',
             body: {
               analysisArea: searchArea,
               preferences: createDefaultPreferenceProfile(),
-              useSyntheticDemo: true,
               clientRequestSeq: 2,
             },
           });
           expect(searchRes.status).toBe(200);
+          expect(rentcastListingsCalls).toBe(1);
+          expect(rentcastAvmCalls).toBe(0);
           const sessionId: string = searchRes.body.sessionId;
           const firstListing = searchRes.body.listings[0];
           expect(firstListing).toBeDefined();
 
-          // Step B1: /avm WITHOUT propertySnapshot on Instance B returns 404 (session not in Instance B memory)
-          const avmNoSnapB = await invokeExpressApp(instanceB, {
-            method: 'POST',
-            url: `/api/properties/${encodeURIComponent(firstListing.id)}/avm`,
-            body: {
-              sessionId,
-              useSyntheticDemo: true,
-              clientRequestSeq: 2,
-            },
-          });
-          expect(avmNoSnapB.status).toBe(404);
-
-          // Step B2: /explain on Instance B BEFORE Instance B has seen sessionId returns 404
-          // because server-authoritative /api/explain refuses unverified client propertyContext when absent from sessionStore!
-          // (Proves why --max-instances=1 or shared session store is required on Cloud Run.)
-          const explainSplitBrainB = await invokeExpressApp(instanceB, {
+          // Step B1: POST /api/explain on fresh Instance B (empty memory!) hydrates session durably -> 200 OK & 0 repeated RentCast calls!
+          const explainHydratedB = await invokeExpressApp(instanceB, {
             method: 'POST',
             url: '/api/explain',
             body: {
               sessionId,
               propertyId: firstListing.id,
               preferences: createDefaultPreferenceProfile(),
-              useSyntheticDemo: true,
               clientRequestSeq: 3,
             },
           });
-          expect(explainSplitBrainB.status).toBe(404);
+          expect(explainHydratedB.status).toBe(200);
+          expect(ExplainResponseSchema.safeParse(explainHydratedB.body).success).toBe(true);
+          expect(rentcastListingsCalls).toBe(1);
+          expect(rentcastAvmCalls).toBe(0);
 
-          // Step B3: /avm WITH propertySnapshot (as sent by <App />) on Instance B reconstructs subject cleanly (200 OK)
-          const avmWithSnapB = await invokeExpressApp(instanceB, {
+          // Step B2: POST /api/properties/:id/avm WITHOUT propertySnapshot on Instance B also hydrates durably -> 200 OK (1 AVM call, 0 listings re-fetch)
+          const avmHydratedB = await invokeExpressApp(instanceB, {
             method: 'POST',
             url: `/api/properties/${encodeURIComponent(firstListing.id)}/avm`,
             body: {
               sessionId,
-              propertySnapshot: {
-                formattedAddress: firstListing.formattedAddress,
-                city: firstListing.city,
-                state: firstListing.state,
-                zipCode: firstListing.zipCode,
-                latitude: firstListing.latitude,
-                longitude: firstListing.longitude,
-                propertyType: firstListing.propertyType,
-                bedrooms: firstListing.bedrooms,
-                bathrooms: firstListing.bathrooms,
-                squareFootage: firstListing.squareFootage,
-                lotSize: firstListing.lotSize,
-                yearBuilt: firstListing.yearBuilt,
-                askingPrice: firstListing.askingPrice,
-                listingLastSeenAt: firstListing.listingLastSeenAt,
-              },
-              useSyntheticDemo: true,
               clientRequestSeq: 4,
             },
           });
-          expect(avmWithSnapB.status).toBe(200);
+          expect(avmHydratedB.status).toBe(200);
+          expect(PropertyAvmResponseSchema.safeParse(avmHydratedB.body).success).toBe(true);
+          expect(rentcastListingsCalls).toBe(1);
+          expect(rentcastAvmCalls).toBe(1);
 
-          // Step A2: Same-instance /api/explain on Instance A succeeds (200 OK) with full accessibility + server authority
-          const explainSameInstanceA = await invokeExpressApp(instanceA, {
+          // Step B3: Genuinely missing/expired session returns 409 SESSION_EXPIRED on /api/explain, /avm (without snapshot), and /expand with 0 RentCast calls!
+          const explainExpired = await invokeExpressApp(instanceB, {
+            method: 'POST',
+            url: '/api/explain',
+            body: {
+              sessionId: 'sess_genuinely_expired_999',
+              propertyId: firstListing.id,
+              preferences: createDefaultPreferenceProfile(),
+              clientRequestSeq: 5,
+            },
+          });
+          expect(explainExpired.status).toBe(409);
+          expect(ApiErrorResponseSchema.safeParse(explainExpired.body).success).toBe(true);
+          expect(explainExpired.body.error.code).toBe('SESSION_EXPIRED');
+          expect(explainExpired.body.error.uiState).toBe('recovery');
+
+          const avmExpired = await invokeExpressApp(instanceB, {
+            method: 'POST',
+            url: `/api/properties/${encodeURIComponent(firstListing.id)}/avm`,
+            body: {
+              sessionId: 'sess_genuinely_expired_999',
+              clientRequestSeq: 6,
+            },
+          });
+          expect(avmExpired.status).toBe(409);
+          expect(ApiErrorResponseSchema.safeParse(avmExpired.body).success).toBe(true);
+          expect(avmExpired.body.error.code).toBe('SESSION_EXPIRED');
+
+          const expandExpired = await invokeExpressApp(instanceB, {
+            method: 'POST',
+            url: '/api/sessions/sess_genuinely_expired_999/expand',
+            body: {
+              userConfirmed: true,
+              clientRequestSeq: 7,
+            },
+          });
+          expect(expandExpired.status).toBe(409);
+          expect(ApiErrorResponseSchema.safeParse(expandExpired.body).success).toBe(true);
+          expect(expandExpired.body.error.code).toBe('SESSION_EXPIRED');
+
+          // Zero paid RentCast calls were triggered by any expired-session request!
+          expect(rentcastListingsCalls).toBe(1);
+          expect(rentcastAvmCalls).toBe(1);
+
+          // Step B4: Unknown propertyId on an ACTIVE session still returns 404 NOT_FOUND (not 409) with 0 RentCast calls!
+          const unknownPropActiveSession = await invokeExpressApp(instanceB, {
             method: 'POST',
             url: '/api/explain',
             body: {
               sessionId,
-              propertyId: firstListing.id,
+              propertyId: 'prop_nonexistent_active_session',
               preferences: createDefaultPreferenceProfile(),
-              useSyntheticDemo: true,
-              clientRequestSeq: 5,
+              clientRequestSeq: 8,
             },
           });
-          expect(explainSameInstanceA.status).toBe(200);
-          expect(ExplainResponseSchema.safeParse(explainSameInstanceA.body).success).toBe(true);
+          expect(unknownPropActiveSession.status).toBe(404);
+          expect(ApiErrorResponseSchema.safeParse(unknownPropActiveSession.body).success).toBe(true);
+          expect(unknownPropActiveSession.body.error.code).toBe('NOT_FOUND');
+          expect(rentcastListingsCalls).toBe(1);
+          expect(rentcastAvmCalls).toBe(1);
         } finally {
+          await propA.sessionStore.close?.();
+          await propB.sessionStore.close?.();
           await propA.budgetStore.close?.();
           await propB.budgetStore.close?.();
         }

@@ -45,6 +45,7 @@ import {
   type ExplainModule,
   type ExplainServiceDependencies,
   type PropertyContextResolution,
+  SessionExpiredError,
   createExplainModule,
 } from './explain';
 import {
@@ -207,10 +208,15 @@ export function createApp(options: CreateAppOptions = {}): Express {
     preferences: PreferenceProfile,
     useSyntheticDemo?: boolean
   ): Promise<PropertyContextResolution | null> => {
-    const resolved = propertyModule.getResolvedSessionProperty(
+    const resolved = await propertyModule.getResolvedSessionPropertyAsync(
       sessionId,
       propertyId
     );
+    if (!resolved.sessionExists) {
+      throw new SessionExpiredError(
+        `Analysis session "${sessionId}" expired or is unavailable after a server restart or revision rollout. No paid provider calls were repeated automatically; re-analyze the area only if you wish to start a new session.`
+      );
+    }
     const baseRecord = resolved.detail ?? resolved.listing;
     if (!baseRecord) {
       // Never trust forged/unverified client propertyContext when absent from server state

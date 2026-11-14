@@ -40,6 +40,7 @@ All `4xx` and `5xx` API responses conform to `ApiErrorResponseSchema`, stripping
 | `SOURCE_POLICY_VIOLATION` | `400` | `recovery` | `false` | Caller attempted to submit disallowed source (`google_places_context`) into analysis |
 | `UNSUPPORTED_AREA` | `422` | `unsupported_area` | `false` | Non-US coordinates or non-US location query |
 | `SETUP_NEEDED` | `503` | `setup_needed` | `false` | Required server secret is unconfigured (`missingEnvVarNames` lists variable names only, e.g. `["RENTCAST_API_KEY"]`) |
+| `SESSION_EXPIRED` | `409` | `recovery` | `false` | Analysis session expired past TTL or unavailable after restart/revision rollout; zero paid provider calls are repeated automatically |
 | `SESSION_CAP_REACHED` | `429` | `quota_exhausted` | `true` *(after `/expand`)* | Session limit (`1` search / `5` AVMs default, or `10` AVMs expanded) reached |
 | `GLOBAL_QUOTA_EXHAUSTED` | `429` | `quota_exhausted` | `false` | Global monthly cap (`RENTCAST_GLOBAL_MONTHLY_LIMIT`, default `35`) reached |
 | `BUDGET_STORE_UNAVAILABLE` | `503` | `quota_exhausted` | `true` | Durable atomic store (`firestore` / `sqlite`) failed closed to protect monthly allowance |

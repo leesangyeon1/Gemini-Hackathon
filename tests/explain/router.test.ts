@@ -165,4 +165,26 @@ describe('explain/router HTTP API', () => {
     expect(response.body.error.message).toContain('prop_nonexistent_999');
     expect(response.body.clientRequestSeq).toBe(88);
   });
+
+  it('POST /api/explain returns 409 Conflict with SESSION_EXPIRED when resolver throws SessionExpiredError', async () => {
+    const { SessionExpiredError } = await import('../../src/server/explain');
+    const resolvePropertyContext = vi.fn().mockRejectedValue(
+      new SessionExpiredError('Session sess_expired_999 has expired.')
+    );
+    const { explainRouter } = createExplainModule(config, { resolvePropertyContext });
+
+    const response = await dispatchRequest(explainRouter, 'POST', '/', {
+      sessionId: 'sess_test_123',
+      propertyId: 'prop_http_01',
+      preferences: createDefaultPreferenceProfile(),
+      clientRequestSeq: 99,
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('SESSION_EXPIRED');
+    expect(response.body.error.message).toContain('sess_expired_999 has expired');
+    expect(response.body.error.uiState).toBe('recovery');
+    expect(response.body.error.retryable).toBe(false);
+    expect(response.body.clientRequestSeq).toBe(99);
+  });
 });

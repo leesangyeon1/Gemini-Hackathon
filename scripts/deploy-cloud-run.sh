@@ -4,20 +4,31 @@ set -euo pipefail
 # ==============================================================================
 # Foreal-Estate — Google Cloud Run Deployment Script
 #
+# Zero local ADC requirement: uses active `gcloud` CLI auth (`gcloud auth login`),
+# NOT `~/.config/gcloud/application_default_credentials.json`. Cloud Run runtime
+# authenticates to Firestore via its attached service account metadata token.
+#
 # Strict preflight checks enforce:
-#   - Confirmed GCP project, Cloud Run region, and runtime service account
+#   - Confirmed GCP project, Cloud Run region (defaults to `us-west1`), and SA
 #   - Explicit user confirmation of billing & hard spending/quota controls
-#   - Secret Manager separation for server-only keys (RENTCAST_API_KEY, GEMINI_API_KEY,
-#     optional GOOGLE_PLACES_SERVER_KEY) vs. restricted browser key (GOOGLE_MAPS_BROWSER_KEY)
-#   - Durable Firestore atomic budget mode (`BUDGET_STORE_MODE=firestore`)
-#   - Session affinity + max-instances=1 default so in-memory sessionStore does not split-brain
+#   - Verified ENABLED numeric Secret Manager versions (never assumes `1` or `latest`)
+#   - Optional GOOGLE_PLACES_SERVER_KEY only when ENABLE_PLACES_SERVER_SECRET=true
+#   - Best-effort session affinity + max-instances=1 + durable Firestore budget/session store
 #   - RentCast global monthly limit strictly below the 50-call free tier
 # ==============================================================================
 
+GCLOUD_BIN="${GCLOUD_BIN:-$(command -v gcloud 2>/dev/null || echo /opt/homebrew/bin/gcloud)}"
 SERVICE_NAME="${CLOUD_RUN_SERVICE_NAME:-foreal-estate}"
+CLOUD_RUN_REGION="${CLOUD_RUN_REGION:-us-west1}"
+
 RENTCAST_SECRET_NAME="${RENTCAST_SECRET_NAME:-foreal-rentcast-api-key}"
 GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-foreal-gemini-api-key}"
-GOOGLE_PLACES_SECRET_NAME="${GOOGLE_PLACES_SECRET_NAME:-}"
+GOOGLE_PLACES_SECRET_NAME="${GOOGLE_PLACES_SECRET_NAME:-foreal-google-places-server-key}"
+ENABLE_PLACES_SERVER_SECRET="${ENABLE_PLACES_SERVER_SECRET:-false}"
+
+RENTCAST_SECRET_VERSION="${RENTCAST_SECRET_VERSION:-}"
+GEMINI_SECRET_VERSION="${GEMINI_SECRET_VERSION:-}"
+GOOGLE_PLACES_SECRET_VERSION="${GOOGLE_PLACES_SECRET_VERSION:-}"
 
 CLOUD_RUN_MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-0}"
 CLOUD_RUN_MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-1}"
@@ -46,10 +57,52 @@ require_env() {
   fi
 }
 
-echo "[deploy-cloud-run] Running strict preflight checks..."
+resolve_verified_secret_version() {
+  local secret_name="$1"
+  local explicit_version="$2"
 
-if ! command -v gcloud >/dev/null 2>&1; then
-  fail "'gcloud' CLI was not found in PATH. Install Google Cloud SDK and authenticate before deploying."
+  # Ensure secret resource exists first (metadata only; never reads secret payload)
+  "${GCLOUD_BIN}" secrets describe "${secret_name}" \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --quiet >/dev/null || fail "Secret '${secret_name}' was not found in project '${GOOGLE_CLOUD_PROJECT}'."
+
+  local resolved_version=""
+  if [[ -n "${explicit_version}" ]]; then
+    if ! [[ "${explicit_version}" =~ ^[0-9]+$ ]]; then
+      fail "Explicit version '${explicit_version}' for secret '${secret_name}' must be a numeric version ID (never 'latest')."
+    fi
+    local state
+    state="$("${GCLOUD_BIN}" secrets versions describe "${explicit_version}" \
+      --secret="${secret_name}" \
+      --project="${GOOGLE_CLOUD_PROJECT}" \
+      --format='value(state)' \
+      --quiet)"
+    if [[ "${state}" != "ENABLED" ]]; then
+      fail "Secret '${secret_name}' version '${explicit_version}' is not ENABLED (state='${state:-unknown}')."
+    fi
+    resolved_version="${explicit_version}"
+  else
+    local raw_name
+    raw_name="$("${GCLOUD_BIN}" secrets versions list "${secret_name}" \
+      --project="${GOOGLE_CLOUD_PROJECT}" \
+      --filter='state=ENABLED' \
+      --sort-by='~createTime' \
+      --limit=1 \
+      --format='value(name)' \
+      --quiet)"
+    resolved_version="${raw_name##*/}"
+    if ! [[ "${resolved_version}" =~ ^[0-9]+$ ]]; then
+      fail "No ENABLED numeric version found for secret '${secret_name}' in project '${GOOGLE_CLOUD_PROJECT}'."
+    fi
+  fi
+
+  echo "${resolved_version}"
+}
+
+echo "[deploy-cloud-run] Running strict preflight checks (region=${CLOUD_RUN_REGION})..."
+
+if [[ ! -x "${GCLOUD_BIN}" ]]; then
+  fail "'gcloud' CLI was not found or is not executable (${GCLOUD_BIN})."
 fi
 
 require_env "GOOGLE_CLOUD_PROJECT"
@@ -92,20 +145,21 @@ for env_val in \
   fi
 done
 
-# Verify active gcloud authentication
-if ! gcloud auth list --filter="status:ACTIVE" --format="value(account)" --quiet 2>/dev/null | grep -q .; then
-  fail "No active gcloud account found. Run 'gcloud auth login' before deploying."
+# Verify active gcloud CLI authentication (zero ADC required)
+if ! "${GCLOUD_BIN}" auth list --filter="status:ACTIVE" --format="value(account)" --quiet 2>/dev/null | grep -q .; then
+  fail "No active gcloud account found. Run '${GCLOUD_BIN} auth login' before deploying."
 fi
 
-# Verify required Secret Manager secrets exist (never reading secret values)
-echo "[deploy-cloud-run] Verifying Secret Manager entries in project '${GOOGLE_CLOUD_PROJECT}'..."
-gcloud secrets describe "${RENTCAST_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" --quiet >/dev/null
-gcloud secrets describe "${GEMINI_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" --quiet >/dev/null
+echo "[deploy-cloud-run] Resolving verified ENABLED numeric Secret Manager versions in '${GOOGLE_CLOUD_PROJECT}'..."
+RENTCAST_VER="$(resolve_verified_secret_version "${RENTCAST_SECRET_NAME}" "${RENTCAST_SECRET_VERSION}")"
+GEMINI_VER="$(resolve_verified_secret_version "${GEMINI_SECRET_NAME}" "${GEMINI_SECRET_VERSION}")"
+echo "[deploy-cloud-run] Verified secret versions: ${RENTCAST_SECRET_NAME}:${RENTCAST_VER}, ${GEMINI_SECRET_NAME}:${GEMINI_VER}"
 
-SECRETS_ARG="RENTCAST_API_KEY=${RENTCAST_SECRET_NAME}:latest,GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest"
-if [[ -n "${GOOGLE_PLACES_SECRET_NAME}" ]]; then
-  gcloud secrets describe "${GOOGLE_PLACES_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" --quiet >/dev/null
-  SECRETS_ARG="${SECRETS_ARG},GOOGLE_PLACES_SERVER_KEY=${GOOGLE_PLACES_SECRET_NAME}:latest"
+SECRETS_ARG="RENTCAST_API_KEY=${RENTCAST_SECRET_NAME}:${RENTCAST_VER},GEMINI_API_KEY=${GEMINI_SECRET_NAME}:${GEMINI_VER}"
+if [[ "${ENABLE_PLACES_SERVER_SECRET}" == "true" ]]; then
+  PLACES_VER="$(resolve_verified_secret_version "${GOOGLE_PLACES_SECRET_NAME}" "${GOOGLE_PLACES_SECRET_VERSION}")"
+  echo "[deploy-cloud-run] Verified optional secret version: ${GOOGLE_PLACES_SECRET_NAME}:${PLACES_VER}"
+  SECRETS_ARG="${SECRETS_ARG},GOOGLE_PLACES_SERVER_KEY=${GOOGLE_PLACES_SECRET_NAME}:${PLACES_VER}"
 fi
 
 ENV_VARS_ARG="NODE_ENV=production"
@@ -124,7 +178,7 @@ if [[ -n "${GOOGLE_MAPS_BROWSER_KEY}" ]]; then
 fi
 
 echo "[deploy-cloud-run] Deploying '${SERVICE_NAME}' to Cloud Run (${CLOUD_RUN_REGION})..."
-gcloud run deploy "${SERVICE_NAME}" \
+"${GCLOUD_BIN}" run deploy "${SERVICE_NAME}" \
   --source=. \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --region="${CLOUD_RUN_REGION}" \
@@ -140,7 +194,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --set-env-vars="${ENV_VARS_ARG}" \
   --quiet
 
-SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+SERVICE_URL="$("${GCLOUD_BIN}" run services describe "${SERVICE_NAME}" \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --region="${CLOUD_RUN_REGION}" \
   --format='value(status.url)' \

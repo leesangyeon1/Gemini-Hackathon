@@ -958,4 +958,371 @@ describe('Workstream 1: Express Property, Region & Session Endpoints', () => {
     expect(errTimeout.status).toBe(504);
     expect(errTimeout.body.error.code).toBe('UPSTREAM_TIMEOUT');
   });
+
+  it('persists session listings and AVM details across SQLite server restarts with 0 repeated RentCast calls and returns 409 SESSION_EXPIRED for expired/unknown sessions', async () => {
+    const sqlitePath = createTempSqlitePath();
+    let currentNow = new Date('2026-11-14T10:00:00.000Z');
+    let rentcastListingsCalls = 0;
+    let rentcastAvmCalls = 0;
+
+    const mockFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('/listings/sale')) {
+        rentcastListingsCalls += 1;
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'rc-sqlite-restart-1',
+              formattedAddress: '700 Lavaca St, Austin, TX 78701',
+              city: 'Austin',
+              state: 'TX',
+              zipCode: '78701',
+              latitude: 30.2695,
+              longitude: -97.745,
+              propertyType: 'Single Family',
+              bedrooms: 3,
+              bathrooms: 2,
+              squareFootage: 1950,
+              yearBuilt: 2014,
+              price: 520_000,
+              lastSeenDate: '2026-11-13T10:00:00.000Z',
+            },
+          ]),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/avm/value')) {
+        rentcastAvmCalls += 1;
+        return new Response(
+          JSON.stringify({
+            price: 575_000,
+            priceRangeLow: 540_000,
+            priceRangeHigh: 610_000,
+            comparables: [],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('[]', { status: 200 });
+    };
+
+    const config = loadServerConfig({
+      NODE_ENV: 'test',
+      BUDGET_STORE_MODE: 'sqlite',
+      SQLITE_BUDGET_PATH: sqlitePath,
+      RENTCAST_API_KEY: 'rc_test_sqlite_session_key',
+      RENTCAST_GLOBAL_MONTHLY_LIMIT: '35',
+    });
+
+    // Server Instance 1: Run search + AVM on rc-sqlite-restart-1
+    const mod1 = createPropertyModule(config, {
+      fetchFn: mockFetch,
+      budgetStoreOptions: { mode: 'sqlite', sqlitePath, nowFn: () => currentNow },
+    });
+    const app1 = createApp({
+      config,
+      regionsRouter: mod1.regionsRouter,
+      propertiesRouter: mod1.propertiesRouter,
+      sessionsRouter: mod1.sessionsRouter,
+    });
+
+    const searchRes = await invokeExpressApp(app1, {
+      method: 'POST',
+      url: '/api/properties/search',
+      body: {
+        sessionId: 'sess_sqlite_restart_01',
+        analysisArea: AUSTIN_AREA,
+        limit: 5,
+      },
+    });
+    expect(searchRes.status).toBe(200);
+    expect(rentcastListingsCalls).toBe(1);
+
+    const avmRes1 = await invokeExpressApp(app1, {
+      method: 'POST',
+      url: '/api/properties/rc-sqlite-restart-1/avm',
+      body: { sessionId: 'sess_sqlite_restart_01' },
+    });
+    expect(avmRes1.status).toBe(200);
+    expect(avmRes1.body.fromCache).toBe(false);
+    expect(rentcastAvmCalls).toBe(1);
+
+    mod1.budgetStore.close?.();
+
+    // Server Instance 2: Cold restart reading the same SQLite file (empty in-memory Map)
+    const mod2 = createPropertyModule(config, {
+      fetchFn: mockFetch,
+      budgetStoreOptions: { mode: 'sqlite', sqlitePath, nowFn: () => currentNow },
+    });
+    const app2 = createApp({
+      config,
+      regionsRouter: mod2.regionsRouter,
+      propertiesRouter: mod2.propertiesRouter,
+      sessionsRouter: mod2.sessionsRouter,
+    });
+
+    // Synchronous & async resolution both hydrate from foreal_property_sessions with 0 RentCast calls
+    const resolvedSync = mod2.getResolvedSessionProperty(
+      'sess_sqlite_restart_01',
+      'rc-sqlite-restart-1'
+    );
+    expect(resolvedSync.sessionExists).toBe(true);
+    expect(resolvedSync.detail?.avmPrice).toBe(575_000);
+    expect(resolvedSync.session?.analysisArea?.city).toBe('Austin');
+
+    const resolvedAsync = await mod2.getResolvedSessionPropertyAsync(
+      'sess_sqlite_restart_01',
+      'rc-sqlite-restart-1'
+    );
+    expect(resolvedAsync.sessionExists).toBe(true);
+    expect(resolvedAsync.detail?.avmPrice).toBe(575_000);
+
+    // Repeat AVM request on Instance 2 succeeds from hydrated session with 0 additional RentCast calls!
+    const avmResAfterRestart = await invokeExpressApp(app2, {
+      method: 'POST',
+      url: '/api/properties/rc-sqlite-restart-1/avm',
+      body: { sessionId: 'sess_sqlite_restart_01' },
+    });
+    expect(avmResAfterRestart.status).toBe(200);
+    expect(avmResAfterRestart.body.fromCache).toBe(true);
+    expect(rentcastListingsCalls).toBe(1);
+    expect(rentcastAvmCalls).toBe(1);
+
+    // Unknown propertyId inside a valid active session still returns 404 NOT_FOUND
+    const unknownPropInActiveSession = await invokeExpressApp(app2, {
+      method: 'POST',
+      url: '/api/properties/rc-nonexistent-prop/avm',
+      body: { sessionId: 'sess_sqlite_restart_01' },
+    });
+    expect(unknownPropInActiveSession.status).toBe(404);
+    expect(unknownPropInActiveSession.body.error.code).toBe('NOT_FOUND');
+
+    // Unknown session returns 409 SESSION_EXPIRED on /avm (without propertySnapshot) and /expand
+    const unknownSessionAvm = await invokeExpressApp(app2, {
+      method: 'POST',
+      url: '/api/properties/rc-sqlite-restart-1/avm',
+      body: { sessionId: 'sess_unknown_never_created' },
+    });
+    expect(unknownSessionAvm.status).toBe(409);
+    const parsedExpiredErr = ApiErrorResponseSchema.parse(unknownSessionAvm.body);
+    expect(parsedExpiredErr.error.code).toBe('SESSION_EXPIRED');
+    expect(parsedExpiredErr.error.uiState).toBe('recovery');
+    expect(parsedExpiredErr.error.retryable).toBe(false);
+
+    // Advance clock past 24h TTL -> sess_sqlite_restart_01 expires and returns sessionExists: false & 409 SESSION_EXPIRED
+    currentNow = new Date('2026-11-15T11:00:00.000Z');
+    const expiredLookup = await mod2.getResolvedSessionPropertyAsync(
+      'sess_sqlite_restart_01',
+      'rc-sqlite-restart-1'
+    );
+    expect(expiredLookup.sessionExists).toBe(false);
+    expect(expiredLookup.session).toBeNull();
+
+    const expiredExpand = await invokeExpressApp(app2, {
+      method: 'POST',
+      url: '/api/sessions/sess_sqlite_restart_01/expand',
+      body: { userConfirmed: true },
+    });
+    expect(expiredExpand.status).toBe(409);
+    expect(expiredExpand.body.error.code).toBe('SESSION_EXPIRED');
+    expect(rentcastListingsCalls).toBe(1);
+    expect(rentcastAvmCalls).toBe(1);
+
+    mod2.budgetStore.close?.();
+  });
+
+  it('hydrates sessions asynchronously from mocked Firestore (foreal_sessions) across separate Cloud Run instances with 0 repeated RentCast calls', async () => {
+    let rentcastListingsCalls = 0;
+    let rentcastAvmCalls = 0;
+    let budgetRuntimeCalls = 0;
+    const firestoreSessionDocs = new Map<string, unknown>();
+
+    const mockFirestoreAndRentcastFetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const method = (init?.method ?? 'GET').toUpperCase();
+
+      // 1. Mock Firestore foreal_sessions collection
+      if (url.includes('/documents/foreal_sessions/')) {
+        const docId = decodeURIComponent(
+          url.split('/documents/foreal_sessions/')[1]!.split('?')[0]!
+        );
+        if (method === 'PATCH' || method === 'POST') {
+          const parsedBody = JSON.parse(String(init?.body ?? '{}'));
+          firestoreSessionDocs.set(docId, parsedBody);
+          return new Response(JSON.stringify(parsedBody), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const stored = firestoreSessionDocs.get(docId);
+        if (!stored) {
+          return new Response(JSON.stringify({ error: 'Not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify(stored), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // 2. Mock Firestore rentcast_budget atomic commit + GET
+      if (url.endsWith(':commit') && method === 'POST') {
+        budgetRuntimeCalls += 1;
+        return new Response(JSON.stringify({ writeResults: [{}] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/documents/rentcast_budget/')) {
+        return new Response(
+          JSON.stringify({
+            name: 'projects/cr-session-proj/databases/(default)/documents/rentcast_budget/2026-11',
+            updateTime: '2026-11-14T10:00:00.000000Z',
+            fields: {
+              runtimeSpentCalls: { integerValue: String(budgetRuntimeCalls) },
+              sessions: { mapValue: { fields: {} } },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // 3. Mock RentCast API
+      if (url.includes('/listings/sale')) {
+        rentcastListingsCalls += 1;
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'rc-fs-prop-1',
+              formattedAddress: '800 Congress Ave, Austin, TX 78701',
+              city: 'Austin',
+              state: 'TX',
+              zipCode: '78701',
+              latitude: 30.27,
+              longitude: -97.742,
+              propertyType: 'Condo',
+              bedrooms: 2,
+              bathrooms: 2,
+              squareFootage: 1320,
+              yearBuilt: 2019,
+              price: 610_000,
+              lastSeenDate: '2026-11-13T10:00:00.000Z',
+            },
+          ]),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/avm/value')) {
+        rentcastAvmCalls += 1;
+        return new Response(
+          JSON.stringify({
+            price: 660_000,
+            priceRangeLow: 625_000,
+            priceRangeHigh: 695_000,
+            comparables: [],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      return new Response('{}', { status: 200 });
+    };
+
+    const config = loadServerConfig({
+      NODE_ENV: 'test',
+      BUDGET_STORE_MODE: 'firestore',
+      GOOGLE_CLOUD_PROJECT: 'cr-session-proj',
+      RENTCAST_API_KEY: 'rc_test_firestore_session_key',
+      RENTCAST_GLOBAL_MONTHLY_LIMIT: '35',
+    });
+
+    // Cloud Run Revision 1: Search + on-demand AVM
+    const rev1Mod = createPropertyModule(config, {
+      fetchFn: mockFirestoreAndRentcastFetch,
+      budgetStoreOptions: {
+        mode: 'firestore',
+        googleCloudProject: 'cr-session-proj',
+        firestoreAccessTokenProvider: async () => 'mock-fs-token',
+      },
+    });
+    const rev1App = createApp({
+      config,
+      regionsRouter: rev1Mod.regionsRouter,
+      propertiesRouter: rev1Mod.propertiesRouter,
+      sessionsRouter: rev1Mod.sessionsRouter,
+    });
+
+    const searchRes = await invokeExpressApp(rev1App, {
+      method: 'POST',
+      url: '/api/properties/search',
+      body: {
+        sessionId: 'sess_firestore_rev_01',
+        analysisArea: AUSTIN_AREA,
+        limit: 5,
+      },
+    });
+    expect(searchRes.status).toBe(200);
+    expect(firestoreSessionDocs.has('sess_firestore_rev_01')).toBe(true);
+
+    const avmRes = await invokeExpressApp(rev1App, {
+      method: 'POST',
+      url: '/api/properties/rc-fs-prop-1/avm',
+      body: { sessionId: 'sess_firestore_rev_01' },
+    });
+    expect(avmRes.status).toBe(200);
+    expect(rentcastListingsCalls).toBe(1);
+    expect(rentcastAvmCalls).toBe(1);
+
+    // Cloud Run Revision 2: Brand-new container instance with empty in-memory sessionStore
+    const rev2Mod = createPropertyModule(config, {
+      fetchFn: mockFirestoreAndRentcastFetch,
+      budgetStoreOptions: {
+        mode: 'firestore',
+        googleCloudProject: 'cr-session-proj',
+        firestoreAccessTokenProvider: async () => 'mock-fs-token',
+      },
+    });
+    const rev2App = createApp({
+      config,
+      regionsRouter: rev2Mod.regionsRouter,
+      propertiesRouter: rev2Mod.propertiesRouter,
+      sessionsRouter: rev2Mod.sessionsRouter,
+    });
+
+    // Async hydration on Revision 2 recovers session + AVM detail with 0 repeated RentCast calls
+    const hydrated = await rev2Mod.getResolvedSessionPropertyAsync(
+      'sess_firestore_rev_01',
+      'rc-fs-prop-1'
+    );
+    expect(hydrated.sessionExists).toBe(true);
+    expect(hydrated.detail?.avmPrice).toBe(660_000);
+    expect(hydrated.session?.analysisArea?.city).toBe('Austin');
+
+    const avmOnRev2 = await invokeExpressApp(rev2App, {
+      method: 'POST',
+      url: '/api/properties/rc-fs-prop-1/avm',
+      body: { sessionId: 'sess_firestore_rev_01' },
+    });
+    expect(avmOnRev2.status).toBe(200);
+    expect(avmOnRev2.body.fromCache).toBe(true);
+    expect(rentcastListingsCalls).toBe(1);
+    expect(rentcastAvmCalls).toBe(1);
+
+    // Unknown session on Revision 2 returns sessionExists: false and HTTP 409 SESSION_EXPIRED
+    const missingLookup = await rev2Mod.getResolvedSessionPropertyAsync(
+      'sess_firestore_missing_99',
+      'rc-fs-prop-1'
+    );
+    expect(missingLookup.sessionExists).toBe(false);
+
+    const missingAvm = await invokeExpressApp(rev2App, {
+      method: 'POST',
+      url: '/api/properties/rc-fs-prop-1/avm',
+      body: { sessionId: 'sess_firestore_missing_99' },
+    });
+    expect(missingAvm.status).toBe(409);
+    expect(missingAvm.body.error.code).toBe('SESSION_EXPIRED');
+  });
 });
