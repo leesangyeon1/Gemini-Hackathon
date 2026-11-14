@@ -10,17 +10,19 @@ set -euo pipefail
 #   - Secret Manager separation for server-only keys (RENTCAST_API_KEY, GEMINI_API_KEY,
 #     optional GOOGLE_PLACES_SERVER_KEY) vs. restricted browser key (GOOGLE_MAPS_BROWSER_KEY)
 #   - Durable Firestore atomic budget mode (`BUDGET_STORE_MODE=firestore`)
+#   - Session affinity + max-instances=1 default so in-memory sessionStore does not split-brain
 #   - RentCast global monthly limit strictly below the 50-call free tier
 # ==============================================================================
 
 SERVICE_NAME="${CLOUD_RUN_SERVICE_NAME:-foreal-estate}"
-RENTCAST_SECRET_NAME="${RENTCAST_SECRET_NAME:-rentcast-api-key}"
-GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-gemini-api-key}"
+RENTCAST_SECRET_NAME="${RENTCAST_SECRET_NAME:-foreal-rentcast-api-key}"
+GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-foreal-gemini-api-key}"
 GOOGLE_PLACES_SECRET_NAME="${GOOGLE_PLACES_SECRET_NAME:-}"
 
-CLOUD_RUN_MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-2}"
+CLOUD_RUN_MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-0}"
+CLOUD_RUN_MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-1}"
 CLOUD_RUN_CONCURRENCY="${CLOUD_RUN_CONCURRENCY:-20}"
-CLOUD_RUN_TIMEOUT="${CLOUD_RUN_TIMEOUT:-60s}"
+CLOUD_RUN_TIMEOUT="${CLOUD_RUN_TIMEOUT:-30}"
 
 RENTCAST_GLOBAL_MONTHLY_LIMIT="${RENTCAST_GLOBAL_MONTHLY_LIMIT:-35}"
 RENTCAST_INITIAL_SPENT_CALLS="${RENTCAST_INITIAL_SPENT_CALLS:-0}"
@@ -66,6 +68,10 @@ if ! [[ "${RENTCAST_INITIAL_SPENT_CALLS}" =~ ^[0-9]+$ ]]; then
   fail "RENTCAST_INITIAL_SPENT_CALLS must be a non-negative integer. Got: '${RENTCAST_INITIAL_SPENT_CALLS}'."
 fi
 
+if ! [[ "${CLOUD_RUN_MIN_INSTANCES}" =~ ^[0-9]+$ ]]; then
+  fail "CLOUD_RUN_MIN_INSTANCES must be a non-negative integer. Got: '${CLOUD_RUN_MIN_INSTANCES}'."
+fi
+
 if ! [[ "${CLOUD_RUN_MAX_INSTANCES}" =~ ^[0-9]+$ ]] || (( CLOUD_RUN_MAX_INSTANCES < 1 )); then
   fail "CLOUD_RUN_MAX_INSTANCES must be a positive integer. Got: '${CLOUD_RUN_MAX_INSTANCES}'."
 fi
@@ -74,7 +80,7 @@ if ! [[ "${CLOUD_RUN_CONCURRENCY}" =~ ^[0-9]+$ ]] || (( CLOUD_RUN_CONCURRENCY < 
   fail "CLOUD_RUN_CONCURRENCY must be a positive integer. Got: '${CLOUD_RUN_CONCURRENCY}'."
 fi
 
-# Reject unsafe placeholder secrets or commas in non-secret env vars that use comma-delimited gcloud flags
+# Reject commas in non-secret env vars that use comma-delimited gcloud flags
 for env_val in \
   "${GOOGLE_CLOUD_PROJECT}" \
   "${CLOUD_RUN_REGION}" \
@@ -93,12 +99,12 @@ fi
 
 # Verify required Secret Manager secrets exist (never reading secret values)
 echo "[deploy-cloud-run] Verifying Secret Manager entries in project '${GOOGLE_CLOUD_PROJECT}'..."
-gcloud secrets describe "${RENTCAST_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null
-gcloud secrets describe "${GEMINI_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null
+gcloud secrets describe "${RENTCAST_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" --quiet >/dev/null
+gcloud secrets describe "${GEMINI_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" --quiet >/dev/null
 
 SECRETS_ARG="RENTCAST_API_KEY=${RENTCAST_SECRET_NAME}:latest,GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest"
 if [[ -n "${GOOGLE_PLACES_SECRET_NAME}" ]]; then
-  gcloud secrets describe "${GOOGLE_PLACES_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null
+  gcloud secrets describe "${GOOGLE_PLACES_SECRET_NAME}" --project="${GOOGLE_CLOUD_PROJECT}" --quiet >/dev/null
   SECRETS_ARG="${SECRETS_ARG},GOOGLE_PLACES_SERVER_KEY=${GOOGLE_PLACES_SECRET_NAME}:latest"
 fi
 
@@ -124,17 +130,21 @@ gcloud run deploy "${SERVICE_NAME}" \
   --region="${CLOUD_RUN_REGION}" \
   --port=8080 \
   --service-account="${CLOUD_RUN_SERVICE_ACCOUNT}" \
+  --min-instances="${CLOUD_RUN_MIN_INSTANCES}" \
   --max-instances="${CLOUD_RUN_MAX_INSTANCES}" \
+  --session-affinity \
   --concurrency="${CLOUD_RUN_CONCURRENCY}" \
   --timeout="${CLOUD_RUN_TIMEOUT}" \
   --allow-unauthenticated \
   --set-secrets="${SECRETS_ARG}" \
-  --set-env-vars="${ENV_VARS_ARG}"
+  --set-env-vars="${ENV_VARS_ARG}" \
+  --quiet
 
 SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --region="${CLOUD_RUN_REGION}" \
-  --format='value(status.url)')"
+  --format='value(status.url)' \
+  --quiet)"
 
 if [[ -z "${SERVICE_URL}" ]]; then
   fail "Deployment completed, but failed to retrieve status.url for '${SERVICE_NAME}'."

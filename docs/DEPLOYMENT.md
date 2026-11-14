@@ -14,7 +14,8 @@ Foreal-Estate runs as a single Node.js `v24` (`>= 22.5.0`, verified locally on `
 - [`Dockerfile`](../Dockerfile) uses a two-stage `node:24-slim` build:
   1. **Builder stage:** Installs dependencies with `npm ci`, executes `npm run build` (`vite build` -> `dist/client` and `vite build --ssr src/server/index.ts --outDir dist/server`), and runs `npm prune --omit=dev`.
   2. **Runtime stage:** Sets `NODE_ENV=production` and `PORT=8080`, copies `package.json`, pruned `node_modules/`, and `dist/`, ensures `.data/` is owned by non-root `node`, switches to `USER node`, exposes port `8080`, and launches `node dist/server/index.js` bound to `0.0.0.0:$PORT`.
-- [`.dockerignore`](../.dockerignore) excludes `.git/`, `node_modules/`, `dist/`, `build/`, `.env`, `.env.*`, `.data/`, `*.sqlite*`, `*.db`, `tests/`, `coverage/`, `logs/`, and OS/editor artifacts so secrets and test fixtures are never baked into the container image.
+- [`.dockerignore`](../.dockerignore) and [`.gcloudignore`](../.gcloudignore) exclude `.git/`, `node_modules/`, `dist/`, `build/`, `.env`, `.env.*`, `.data/`, `*.sqlite*`, `*.db`, `tests/`, `coverage/`, `logs/`, and OS/editor artifacts so secrets and test fixtures are never uploaded to Cloud Build or baked into the container image.
+- Provenance, swarm execution metadata, and Stage 3 verification results are recorded in [`docs/BUILD_PROVENANCE.md`](BUILD_PROVENANCE.md).
 
 ### 1.2 Local Build & Run Verification
 Verify the exact production bundle locally before any cloud deployment:
@@ -45,31 +46,33 @@ Foreal-Estate strictly separates **confidential server secrets** from **public c
 
 | Variable | Classification | Cloud Run Injection | Restrictions & Isolation |
 |---|---|---|---|
-| `RENTCAST_API_KEY` | **Server-only secret** | `--set-secrets` (`rentcast-api-key:latest`) | Used only in server `X-Api-Key` header. Never in `/api/config`, client bundle, logs, or URLs. |
-| `GEMINI_API_KEY` | **Server-only secret** | `--set-secrets` (`gemini-api-key:latest`) | Used only by `@google/genai` on the server for `/api/explain`. |
-| `GOOGLE_PLACES_SERVER_KEY` *(optional)* | **Server-only secret** | `--set-secrets` (`google-places-server-key:latest`) | Optional display-only Places context (`google_places_context`, barred from scoring). Never exposed to browser. |
+| `RENTCAST_API_KEY` | **Server-only secret** | `--set-secrets` (`foreal-rentcast-api-key:latest`) | Used only in server `X-Api-Key` header. Never in `/api/config`, client bundle, logs, or URLs. |
+| `GEMINI_API_KEY` | **Server-only secret** | `--set-secrets` (`foreal-gemini-api-key:latest`) | Used only by `@google/genai` on the server for `/api/explain`. |
+| `GOOGLE_PLACES_SERVER_KEY` *(optional)* | **Server-only secret** | `--set-secrets` (`foreal-google-places-server-key:latest`) | Optional display-only Places context (`google_places_context`, barred from scoring). Never exposed to browser. |
 | `GOOGLE_MAPS_BROWSER_KEY` | **Restricted browser key** | `--set-env-vars` | Intentionally returned via `GET /api/config` (`mapsBrowserKey`). **Must** be restricted in Google Cloud Console by **HTTP referrer** (`https://<service-url>/*`, `http://localhost:5173/*`, `http://localhost:8080/*`) and **API scope** (**Maps JavaScript API only**). |
 
-### Create Secret Manager Entries (Operator Steps)
-Run once per GCP project (never store secret values in git or shell history if avoidable):
+### Create Secret Manager Entries & Provision GCP Resources (`scripts/provision-gcp-resources.sh`)
+Once a billing-linked GCP project is confirmed, run [`scripts/provision-gcp-resources.sh`](../scripts/provision-gcp-resources.sh) (idempotent; enables only required APIs, creates the least-privilege runtime SA `foreal-estate-runtime@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com` with `roles/datastore.user` and per-secret `roles/secretmanager.secretAccessor`, creates `(default)` Firestore Native DB if absent, and prompts securely via `read -r -s` without shell history):
 
 ```bash
 export GOOGLE_CLOUD_PROJECT="<your-gcp-project-id>"
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com secretmanager.googleapis.com firestore.googleapis.com --project="$GOOGLE_CLOUD_PROJECT"
+export CLOUD_RUN_REGION="us-west1"
+export CONFIRM_GCP_PROVISIONING=true
 
-# Create secrets (supply values via stdin / interactive prompt)
-printf '%s' "$RENTCAST_API_KEY_VALUE" | gcloud secrets create rentcast-api-key --data-file=- --project="$GOOGLE_CLOUD_PROJECT"
-printf '%s' "$GEMINI_API_KEY_VALUE" | gcloud secrets create gemini-api-key --data-file=- --project="$GOOGLE_CLOUD_PROJECT"
-# Optional:
-# printf '%s' "$GOOGLE_PLACES_SERVER_KEY_VALUE" | gcloud secrets create google-places-server-key --data-file=- --project="$GOOGLE_CLOUD_PROJECT"
+./scripts/provision-gcp-resources.sh
 ```
 
-Grant the dedicated runtime service account (`CLOUD_RUN_SERVICE_ACCOUNT`) `roles/secretmanager.secretAccessor` only on the required secrets:
+Or run the equivalent operator steps manually (never pass secret values as CLI arguments):
 
 ```bash
-export CLOUD_RUN_SERVICE_ACCOUNT="foreal-estate-runner@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
+export GOOGLE_CLOUD_PROJECT="<your-gcp-project-id>"
+export CLOUD_RUN_SERVICE_ACCOUNT="foreal-estate-runtime@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 
-for secret in rentcast-api-key gemini-api-key; do
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com firestore.googleapis.com maps-backend.googleapis.com --project="$GOOGLE_CLOUD_PROJECT"
+
+for secret in foreal-rentcast-api-key foreal-gemini-api-key; do
+  gcloud secrets create "$secret" --replication-policy="automatic" --project="$GOOGLE_CLOUD_PROJECT"
+  read -r -s val && printf '%s' "$val" | gcloud secrets versions add "$secret" --data-file=- --project="$GOOGLE_CLOUD_PROJECT" && unset val
   gcloud secrets add-iam-policy-binding "$secret" \
     --project="$GOOGLE_CLOUD_PROJECT" \
     --member="serviceAccount:${CLOUD_RUN_SERVICE_ACCOUNT}" \
@@ -108,10 +111,12 @@ gcloud projects add-iam-policy-binding "$GOOGLE_CLOUD_PROJECT" \
 
 Foreal-Estate combines four technical controls to prevent runaway spend:
 
-1. **Cloud Run Scaling Ceilings:**
-   - `--max-instances=2` (caps total concurrent containers)
+1. **Cloud Run Scaling & Session Ceilings (`AUDIT-CR-03`):**
+   - `--min-instances=0` (scales to zero when idle)
+   - `--max-instances=1` (prevents horizontal cost sprawl and keeps in-memory `sessionStore` state single-instance consistent for `/api/properties/:id/avm` and `/api/explain`)
+   - `--session-affinity` (pins repeat browser traffic to the active container revision)
    - `--concurrency=20` (bounded per-container request fan-in)
-   - `--timeout=60s` (prevents hung request billing)
+   - `--timeout=30` (30-second execution ceiling prevents hung request billing)
 2. **Application-Level Atomic RentCast Ceiling (`< 50` Free Tier):**
    - `RENTCAST_GLOBAL_MONTHLY_LIMIT=35` (clamped by `src/server/config.ts` to `1..49`)
    - `RENTCAST_INITIAL_SPENT_CALLS=<prior_calls>` subtracts any calls already spent on the RentCast account before deployment
@@ -132,7 +137,7 @@ Foreal-Estate combines four technical controls to prevent runaway spend:
 ```bash
 export GOOGLE_CLOUD_PROJECT="<your-gcp-project-id>"
 export CLOUD_RUN_REGION="us-west1"
-export CLOUD_RUN_SERVICE_ACCOUNT="foreal-estate-runner@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
+export CLOUD_RUN_SERVICE_ACCOUNT="foreal-estate-runtime@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 export CONFIRM_BILLING_AND_SPENDING_LIMITS=true
 export GOOGLE_MAPS_BROWSER_KEY="<http-referrer-restricted-maps-browser-key>"   # optional
 
@@ -147,11 +152,13 @@ gcloud run deploy foreal-estate \
   --region="$CLOUD_RUN_REGION" \
   --port=8080 \
   --service-account="$CLOUD_RUN_SERVICE_ACCOUNT" \
-  --max-instances=2 \
+  --min-instances=0 \
+  --max-instances=1 \
+  --session-affinity \
   --concurrency=20 \
-  --timeout=60s \
+  --timeout=30 \
   --allow-unauthenticated \
-  --set-secrets="RENTCAST_API_KEY=rentcast-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest" \
+  --set-secrets="RENTCAST_API_KEY=foreal-rentcast-api-key:latest,GEMINI_API_KEY=foreal-gemini-api-key:latest" \
   --set-env-vars="NODE_ENV=production,BUDGET_STORE_MODE=firestore,GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},FIRESTORE_BUDGET_COLLECTION=rentcast_budget,RENTCAST_GLOBAL_MONTHLY_LIMIT=35,RENTCAST_INITIAL_SPENT_CALLS=0,GEMINI_EXPLAIN_MODEL=gemini-4-hydrogen,GEMINI_EXPLAIN_FALLBACK_MODEL=gemini-2.5-flash,OSM_OVERPASS_URL=https://overpass-api.de/api/interpreter,ENABLE_SYNTHETIC_DEMO_MODE=false,GOOGLE_MAPS_BROWSER_KEY=${GOOGLE_MAPS_BROWSER_KEY:-}"
 ```
 
@@ -208,8 +215,13 @@ gcloud run services update-traffic foreal-estate \
 ## 7. Current Deployment Blockers
 
 - **Hosted Prototype URL:** **`BLOCKED / NOT DEPLOYED`**
-- **Observed Workspace Blockers:**
-  1. **Unconfigured & Unauthenticated `gcloud` Workspace:** Although `Google Cloud SDK 593.0.0` (`/opt/homebrew/bin/gcloud`) is present on the host binary path, `gcloud config list` has no active `project` or `run/region`, `gcloud auth list` cannot access credentials in the workspace sandbox (`PermissionError` on `~/.config/gcloud/credentials.db`), and no live GCP deployment was executed.
-  2. **Missing Confirmed GCP Target & Billing Confirmation:** No confirmed `GOOGLE_CLOUD_PROJECT`, `CLOUD_RUN_REGION`, `CLOUD_RUN_SERVICE_ACCOUNT`, or explicit `CONFIRM_BILLING_AND_SPENDING_LIMITS=true` sign-off has been provided.
-  3. **Unprovisioned Secret Manager & Firestore State:** Secret Manager secrets (`RENTCAST_API_KEY`, `GEMINI_API_KEY`, optional `GOOGLE_PLACES_SERVER_KEY`), HTTP-referrer-restricted `GOOGLE_MAPS_BROWSER_KEY`, and the Firestore `(default)` database permissions have not been provisioned in a target project.
-- **Unblocking Action:** Once a user supplies an authenticated `gcloud` session, target GCP project/region, service account, Secret Manager entries, and `CONFIRM_BILLING_AND_SPENDING_LIMITS=true`, run `./scripts/deploy-cloud-run.sh` from a full terminal environment and record the resulting `status.url`.
+- **Phase 4 Read-Only Google Cloud Environment Audit (`2026-11-14 PT`, Google Cloud SDK `593.0.0`):**
+  1. **`gcloud` CLI & Active Auth (`verified`):** `/opt/homebrew/bin/gcloud --version` (exit `0`, SDK `593.0.0`); `/opt/homebrew/bin/gcloud auth list` (exit `0`, active live account `qcd2529@gmail.com`); `/opt/homebrew/bin/gcloud config list` (exit `0`, `core.account = qcd2529@gmail.com`, no `core.project` or `run.region` set).
+  2. **Application Default Credentials (`missing`):** `test -f /Users/isang-yeon/.config/gcloud/application_default_credentials.json` exited `1` (absent).
+  3. **Projects & Billing (`verified` active projects, `missing` billing):** `/opt/homebrew/bin/gcloud projects list` (exit `0`) found two `ACTIVE` projects (`gen-lang-client-0222559199` / `Petpulse` `#733697811999` and `gen-lang-client-0582732543` / `n8ntest` `#686829907635`). `/opt/homebrew/bin/gcloud billing accounts list` (exit `0`) returned `Listed 0 items.`, and `/opt/homebrew/bin/gcloud billing projects describe` (exit `0`) confirmed `billingAccountName: ''` and `billingEnabled: false` on **both** projects. Billing budgets (`gcloud billing budgets list`) are `not checked` because no billing account ID exists.
+  4. **Enabled APIs, Cloud Run, Secrets, Service Accounts & Keys (`missing` / `SERVICE_DISABLED`):**
+     - `gen-lang-client-0222559199`: `services list --enabled` (exit `0`) shows only `generativelanguage.googleapis.com`, `playintegrity.googleapis.com`, `telemetry.googleapis.com`. `run services list --quiet` (exit `1`, `SERVICE_DISABLED` for `run.googleapis.com`), `secrets list --quiet` (exit `1`, `SERVICE_DISABLED` for `secretmanager.googleapis.com`), `iam service-accounts list` (exit `0`, `0` items), `services api-keys list` (exit `0`, `0` items).
+     - `gen-lang-client-0582732543`: `services list --enabled --quiet` (exit `0`) shows only `generativelanguage.googleapis.com`, `playintegrity.googleapis.com`. `run services list --quiet` (exit `1`, `SERVICE_DISABLED` for `run.googleapis.com`), `secrets list --quiet` (exit `1`, `SERVICE_DISABLED` for `secretmanager.googleapis.com`), `iam service-accounts list --quiet` (exit `0`, `0` items), `services api-keys list --quiet` (exit `0`, `0` items).
+  5. **Google One AI Ultra / GCP Promotional Credits (`inaccessible` via `gcloud`):** `gcloud` provides no CLI command to query promotional or Google One AI credit balances; remaining credits must be inspected manually in the Google Cloud Console Billing (**Overview** / **Incentives**) or Google AI Studio billing dashboard.
+  6. **Unconfirmed Deployment Target & Secrets (`missing`):** No confirmed `GOOGLE_CLOUD_PROJECT`, `CLOUD_RUN_REGION`, `CLOUD_RUN_SERVICE_ACCOUNT`, `CONFIRM_BILLING_AND_SPENDING_LIMITS=true`, Firestore `(default)` database, or Secret Manager secrets (`RENTCAST_API_KEY`, `GEMINI_API_KEY`) have been provisioned.
+- **Unblocking Action:** Select or create a billing-enabled GCP project (confirming any Google One AI Ultra / GCP credits in Console), enable `run.googleapis.com`, `cloudbuild.googleapis.com`, `secretmanager.googleapis.com`, and `firestore.googleapis.com`, provision the runtime service account and Secret Manager secrets, and run `./scripts/deploy-cloud-run.sh` with `CONFIRM_BILLING_AND_SPENDING_LIMITS=true`.

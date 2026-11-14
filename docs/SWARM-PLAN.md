@@ -37,7 +37,7 @@ Every writable path has **one single owner**. Workers must never edit files outs
 | `frontend` | `src/client/**`, `tests/client/**` |
 | `explain` | `docs/AI_STUDIO_HANDOFF.md`, `src/server/explain/**`, `tests/explain/**` |
 | `verifier` | `docs/TEST-PLAN.md`, `docs/VERIFICATION-REPORT.md`, `tests/verification/**` *(strictly read-only on `src/**`)* |
-| `release` | `docs/DEPLOYMENT.md`, `docs/PROVENANCE.md`, `docs/SUBMISSION-PACKAGE.md`, `Dockerfile`, `.dockerignore`, `scripts/deploy-cloud-run.sh` |
+| `release` | `docs/DEPLOYMENT.md`, `docs/BUILD_PROVENANCE.md`, `docs/SUBMISSION-PACKAGE.md`, `.gcloudignore`, `Dockerfile`, `.dockerignore`, `scripts/deploy-cloud-run.sh` |
 
 ---
 
@@ -76,13 +76,19 @@ Every writable path has **one single owner**. Workers must never edit files outs
    - `geospatial` implements `src/server/geospatial/**` + `tests/geospatial/**`.
    - `frontend` implements `src/client/**` + `tests/client/**`.
    - `explain` implements `src/server/explain/**` + `tests/explain/**` + `docs/AI_STUDIO_HANDOFF.md` + contract review.
-   - `release` implements `Dockerfile`, `scripts/deploy-cloud-run.sh`, `docs/DEPLOYMENT.md`, `docs/PROVENANCE.md`, `docs/SUBMISSION-PACKAGE.md`.
+   - `release` implements `Dockerfile`, `scripts/deploy-cloud-run.sh`, `docs/DEPLOYMENT.md`, `docs/BUILD_PROVENANCE.md`, `docs/SUBMISSION-PACKAGE.md`.
    - `verifier` drafts `docs/TEST-PLAN.md` and performs **pre-integration inspection**.
 3. **Stage 3 — Integration, Adversarial Verification, Local Smoke Run & Commit**:
    - Authors resolve any pre-integration findings from `verifier`.
    - `integrator` wires all routers in `src/server/app.ts`, verifies full TypeScript build (`npm run typecheck && npm run build`).
    - `verifier` executes full unit/integration/numerical/security test suite, `0.0.0.0:$PORT` startup check, browser/HTTP user-journey + provider-failure checks, README/doc link & formula parity checks, and records actual outputs in `docs/VERIFICATION-REPORT.md`.
-   - `release` updates `docs/PROVENANCE.md` with final commit/test evidence and exact Cloud Run deployment blockers (`gcloud` CLI absent locally; GCP project/billing/Secret Manager credentials unprovided).
+   - `release` updates `docs/BUILD_PROVENANCE.md` with final commit/test evidence.
+4. **Stage 4 — Live Environment Recheck, Cloud/Secret Setup, Browser/AI Studio Integration & Public Cloud Run Deployment**:
+   - **Coordinator (`coordinator`, `gemini-4-carbon-high`)**: Shared configuration, integration, and user decision bundling (`README.md`, `docs/SWARM-PLAN.md`, `package.json`, `.env.example`, `.gitignore`, `src/shared/**`, `src/server/{config,app,index}.ts`).
+   - **Environment / Cloud Setup (`release`, `gemini-4-hydrogen-high`)**: Inspects `/opt/homebrew/bin/gcloud` SDK 593.0.0, projects, billing/credits, APIs, service accounts, Secret Manager, `.gcloudignore`, and executes authorized Cloud Run deployment (`docs/DEPLOYMENT.md`, `docs/BUILD_PROVENANCE.md`, `.gcloudignore`, `Dockerfile`, `scripts/deploy-cloud-run.sh`).
+   - **Credentials / API Integration (`property`, `gemini-4-argon-high`)**: Audits credential loading, Firestore durable budget runtime auth (`metadata.google.internal` + ADC), and bounded live provider verification (`docs/DATA-SOURCES.md`, `docs/decisions/ADR-001-rentcast.md`, `src/server/property/**`, `tests/property/**`).
+   - **Browser / AI Studio Integration (`explain`, `gemini-3.8-flash-high`, with `frontend` `gemini-4-hydrogen-high` for single-owner UI sync)**: Inspects Antigravity CLI (`agy`), Chrome 156 (`chrome://inspect/#remote-debugging`), executes/coordinates real browser & Google AI Studio Build session (`docs/AI_STUDIO_HANDOFF.md`, `src/server/explain/**`, `tests/explain/**`).
+   - **Independent Verifier (`verifier`, `gemini-4-carbon-high`)**: Audits stateless Cloud Run readiness, `.gcloudignore`/bundle secret isolation, and live unauthenticated service verification (`docs/TEST-PLAN.md`, `docs/VERIFICATION-REPORT.md`, `tests/verification/**`).
 
 ---
 

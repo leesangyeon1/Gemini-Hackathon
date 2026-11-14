@@ -143,12 +143,17 @@ export function loadServerConfig(env?: NodeJS.ProcessEnv): ServerConfig {
   );
 
   const rawStoreMode = readNonEmptyString(sourceEnv.BUDGET_STORE_MODE)?.toLowerCase();
+  const isCloudRunRuntime = readNonEmptyString(sourceEnv.K_SERVICE) !== null;
   const budgetStoreMode: BudgetStoreMode =
     rawStoreMode === 'firestore'
       ? 'firestore'
       : rawStoreMode === 'memory'
         ? 'memory'
-        : 'sqlite';
+        : rawStoreMode === 'sqlite'
+          ? 'sqlite'
+          : isCloudRunRuntime
+            ? 'firestore'
+            : 'sqlite';
 
   const rawSecrets: ServerSecrets = {
     rentcastApiKey: readNonEmptyString(sourceEnv.RENTCAST_API_KEY),

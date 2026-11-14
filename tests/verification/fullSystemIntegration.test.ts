@@ -1352,8 +1352,10 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
         '.env.example',
         '.gitignore',
         '.dockerignore',
+        '.gcloudignore',
         'Dockerfile',
         'scripts/deploy-cloud-run.sh',
+        'scripts/provision-gcp-resources.sh',
         'dist/client/index.html',
         'dist/server/index.js',
         'docs/SWARM-PLAN.md',
@@ -1366,7 +1368,7 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
         'docs/VERIFICATION-REPORT.md',
         'docs/DEPLOYMENT.md',
         'docs/AI_STUDIO_HANDOFF.md',
-        'docs/PROVENANCE.md',
+        'docs/BUILD_PROVENANCE.md',
         'docs/SUBMISSION-PACKAGE.md',
         'docs/decisions/ADR-001-rentcast.md',
       ];
@@ -1374,6 +1376,8 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
       for (const rel of requiredFiles) {
         expect(fs.existsSync(path.join(REPO_ROOT, rel)), `Missing required file: ${rel}`).toBe(true);
       }
+      // Consolidate provenance strictly in docs/BUILD_PROVENANCE.md (no duplicate docs/PROVENANCE.md)
+      expect(fs.existsSync(path.join(REPO_ROOT, 'docs/PROVENANCE.md'))).toBe(false);
 
       // Verify 100% of local Markdown links across README.md, docs/*.md, and docs/decisions/*.md resolve on disk
       const markdownFiles = [
@@ -1437,8 +1441,21 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
         await new Promise<void>((resolve) => prodServer.close(() => resolve()));
       }
 
-      // Confirm no .env file is committed or present with secrets
-      expect(fs.existsSync(path.join(REPO_ROOT, '.env'))).toBe(false);
+      // Confirm .env is strictly git-ignored and never tracked in git (while .env.example is tracked)
+      const trackedEnvFiles = execFileSync('git', ['ls-files', '.env', '.env.*'], {
+        cwd: REPO_ROOT,
+        encoding: 'utf8',
+      })
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+      expect(trackedEnvFiles).toEqual(['.env.example']);
+
+      const gitIgnoredEnv = execFileSync('git', ['check-ignore', '.env'], {
+        cwd: REPO_ROOT,
+        encoding: 'utf8',
+      }).trim();
+      expect(gitIgnoredEnv).toBe('.env');
 
       // Verify deploy-cloud-run.sh fails closed with exit code 1 when required vars are unset or limit >= 50
       let unsetFailedClosed = false;
@@ -1488,14 +1505,261 @@ describe('Stage 3 Full-System Post-Integration Adversarial Verification', () => 
       const deployDoc = fs.readFileSync(path.join(REPO_ROOT, 'docs/DEPLOYMENT.md'), 'utf8');
       expect(deployDoc).toContain('BLOCKED / NOT DEPLOYED');
 
-      const provenanceDoc = fs.readFileSync(path.join(REPO_ROOT, 'docs/PROVENANCE.md'), 'utf8');
+      const provenanceDoc = fs.readFileSync(
+        path.join(REPO_ROOT, 'docs/BUILD_PROVENANCE.md'),
+        'utf8'
+      );
       expect(provenanceDoc).toContain('BLOCKED / NOT DEPLOYED');
+      expect(provenanceDoc).toContain('BUILD_PROVENANCE.md');
 
       const submissionDoc = fs.readFileSync(path.join(REPO_ROOT, 'docs/SUBMISSION-PACKAGE.md'), 'utf8');
       expect(submissionDoc).toContain('BLOCKED / NOT DEPLOYED');
 
       const readmeDoc = fs.readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf8');
       expect(readmeDoc).not.toContain('.run.app');
+    });
+
+    it('CR-01: verifies .gcloudignore/.dockerignore/.gitignore secret exclusions, zero VITE_ client secret leaks, runtime GOOGLE_MAPS_BROWSER_KEY isolation, Cloud Run Firestore budget config, and multi-instance sessionStore split-brain behavior', async () => {
+      // 1. Verify .gitignore, .dockerignore, and .gcloudignore all exclude .env, .env.*, .data, and *.sqlite
+      for (const ignoreFile of ['.gitignore', '.dockerignore', '.gcloudignore']) {
+        const ignoreContent = fs.readFileSync(path.join(REPO_ROOT, ignoreFile), 'utf8');
+        expect(ignoreContent, `${ignoreFile} must exclude .env`).toMatch(/^\.env$/m);
+        expect(ignoreContent, `${ignoreFile} must exclude .env.*`).toMatch(/^\.env\.\*$/m);
+        expect(ignoreContent, `${ignoreFile} must exclude .data`).toMatch(/^\.data\/?$/m);
+        expect(ignoreContent, `${ignoreFile} must exclude *.sqlite`).toMatch(/^\*\.sqlite$/m);
+      }
+      const gcloudIgnore = fs.readFileSync(path.join(REPO_ROOT, '.gcloudignore'), 'utf8');
+      expect(gcloudIgnore).toMatch(/^node_modules\/$/m);
+      expect(gcloudIgnore).toMatch(/^dist\/$/m);
+      expect(gcloudIgnore).toMatch(/^\.git\/$/m);
+
+      // 2. Walk all files in src/client/**, index.html, and vite.config.ts for zero VITE_ or server secret references
+      const walkClientFiles = (dir: string): string[] => {
+        const out: string[] = [];
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            out.push(...walkClientFiles(full));
+          } else {
+            out.push(full);
+          }
+        }
+        return out;
+      };
+      const clientSourceFiles = [
+        ...walkClientFiles(path.join(REPO_ROOT, 'src/client')),
+        path.join(REPO_ROOT, 'index.html'),
+      ];
+      expect(clientSourceFiles.length).toBeGreaterThan(5);
+      for (const srcFile of clientSourceFiles) {
+        const srcText = fs.readFileSync(srcFile, 'utf8');
+        expect(srcText, `Unexpected VITE_ env usage in ${srcFile}`).not.toContain('VITE_');
+        expect(srcText, `Unexpected import.meta.env usage in ${srcFile}`).not.toContain(
+          'import.meta.env'
+        );
+        expect(srcText, `Server secret name in ${srcFile}`).not.toContain('RENTCAST_API_KEY');
+        expect(srcText, `Server secret name in ${srcFile}`).not.toContain('GEMINI_API_KEY');
+        expect(srcText, `Server secret name in ${srcFile}`).not.toContain(
+          'GOOGLE_PLACES_SERVER_KEY'
+        );
+      }
+
+      const viteCfgText = fs.readFileSync(path.join(REPO_ROOT, 'vite.config.ts'), 'utf8');
+      expect(viteCfgText).not.toContain('VITE_');
+      expect(viteCfgText).not.toContain('RENTCAST_API_KEY');
+      expect(viteCfgText).not.toContain('GEMINI_API_KEY');
+      expect(viteCfgText).not.toContain('GOOGLE_PLACES_SERVER_KEY');
+
+      // 3. Verify runtime GOOGLE_MAPS_BROWSER_KEY delivery via /api/config without exposing server secrets
+      const mapsBrowserCanary = 'AIzaSy_RESTRICTED_MAPS_BROWSER_KEY_RUNTIME_ONLY';
+      const runtimeCfg = loadServerConfig({
+        NODE_ENV: 'production',
+        BUDGET_STORE_MODE: 'memory',
+        RENTCAST_API_KEY: 'rc_live_secret_do_not_expose',
+        GEMINI_API_KEY: 'gem_live_secret_do_not_expose',
+        GOOGLE_PLACES_SERVER_KEY: 'gplaces_live_secret_do_not_expose',
+        GOOGLE_MAPS_BROWSER_KEY: mapsBrowserCanary,
+      });
+      const cfgApp = createApp({ config: runtimeCfg });
+      const cfgResp = await invokeExpressApp(cfgApp, { method: 'GET', url: '/api/config' });
+      expect(cfgResp.status).toBe(200);
+      expect(PublicRuntimeConfigSchema.safeParse(cfgResp.body).success).toBe(true);
+      expect(cfgResp.body.mapsBrowserKey).toBe(mapsBrowserCanary);
+      expect(cfgResp.body.capabilities.mapsBasemapConfigured).toBe(true);
+      expect(cfgResp.text).not.toContain('rc_live_secret_do_not_expose');
+      expect(cfgResp.text).not.toContain('gem_live_secret_do_not_expose');
+      expect(cfgResp.text).not.toContain('gplaces_live_secret_do_not_expose');
+
+      // 4. Verify AUDIT-CR-01 (K_SERVICE auto-defaults unset BUDGET_STORE_MODE to firestore on Cloud Run)
+      expect(loadServerConfig({ K_SERVICE: 'foreal-estate' }).budgetStoreMode).toBe('firestore');
+      expect(
+        loadServerConfig({ K_SERVICE: 'foreal-estate', BUDGET_STORE_MODE: 'memory' })
+          .budgetStoreMode
+      ).toBe('memory');
+      expect(loadServerConfig({}).budgetStoreMode).toBe('sqlite');
+
+      // 5. Verify Dockerfile & deploy-cloud-run.sh stateless Cloud Run configuration
+      const dockerfileText = fs.readFileSync(path.join(REPO_ROOT, 'Dockerfile'), 'utf8');
+      expect(dockerfileText).toContain('ENV PORT=8080');
+      expect(dockerfileText).toContain('USER node');
+      expect(dockerfileText).toContain('CMD ["node", "dist/server/index.js"]');
+
+      const deployScriptText = fs.readFileSync(
+        path.join(REPO_ROOT, 'scripts/deploy-cloud-run.sh'),
+        'utf8'
+      );
+      expect(deployScriptText).toContain('BUDGET_STORE_MODE=firestore');
+      expect(deployScriptText).toContain('--port=8080');
+      expect(deployScriptText).toContain('CLOUD_RUN_MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-1}"');
+      expect(deployScriptText).toContain('--min-instances=');
+      expect(deployScriptText).toContain('--max-instances=');
+      expect(deployScriptText).toContain('--session-affinity');
+      expect(deployScriptText).toContain('RENTCAST_API_KEY=');
+      expect(deployScriptText).toContain('GEMINI_API_KEY=');
+
+      const provisionScriptPath = path.join(REPO_ROOT, 'scripts/provision-gcp-resources.sh');
+      const provisionScriptText = fs.readFileSync(provisionScriptPath, 'utf8');
+      expect(provisionScriptText).toContain('gcloud secrets add-iam-policy-binding');
+      expect(provisionScriptText).toContain('read -r -s');
+      expect(provisionScriptText).toContain('--data-file=-');
+      execFileSync('bash', ['-n', provisionScriptPath], { stdio: 'pipe' });
+
+      let provisionUnsetFailedClosed = false;
+      try {
+        execFileSync('bash', [provisionScriptPath], {
+          env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+          stdio: 'pipe',
+        });
+      } catch (err: any) {
+        provisionUnsetFailedClosed = err.status === 1;
+      }
+      expect(provisionUnsetFailedClosed).toBe(true);
+
+      // 5. Simulate 2 separate Cloud Run container instances sharing durable SQLite/Firestore budget storage
+      //    but having isolated process-local PropertySessionStore maps.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'foreal-cr-multi-'));
+      const sharedSqlitePath = path.join(tmpDir, 'shared-durable-budget.sqlite');
+      try {
+        const instanceConfig = loadServerConfig({
+          NODE_ENV: 'production',
+          BUDGET_STORE_MODE: 'sqlite',
+          SQLITE_BUDGET_PATH: sharedSqlitePath,
+          ENABLE_SYNTHETIC_DEMO_MODE: 'true',
+          RENTCAST_GLOBAL_MONTHLY_LIMIT: '35',
+        });
+
+        const propA = createPropertyModule(instanceConfig);
+        const instanceA = createApp({ config: instanceConfig, propertyModule: propA });
+        const propB = createPropertyModule(instanceConfig);
+        const instanceB = createApp({ config: instanceConfig, propertyModule: propB });
+
+        try {
+          const resolveRes = await invokeExpressApp(instanceA, {
+            method: 'POST',
+            url: '/api/regions/resolve',
+            body: {
+              query: 'Seattle, WA',
+              useSyntheticDemo: true,
+              clientRequestSeq: 1,
+            },
+          });
+          expect(resolveRes.status).toBe(200);
+          const searchArea = resolveRes.body.selectedArea;
+          expect(searchArea).toBeDefined();
+
+          // Step A: Search lands on Cloud Run Instance A
+          const searchRes = await invokeExpressApp(instanceA, {
+            method: 'POST',
+            url: '/api/properties/search',
+            body: {
+              analysisArea: searchArea,
+              preferences: createDefaultPreferenceProfile(),
+              useSyntheticDemo: true,
+              clientRequestSeq: 2,
+            },
+          });
+          expect(searchRes.status).toBe(200);
+          const sessionId: string = searchRes.body.sessionId;
+          const firstListing = searchRes.body.listings[0];
+          expect(firstListing).toBeDefined();
+
+          // Step B1: /avm WITHOUT propertySnapshot on Instance B returns 404 (session not in Instance B memory)
+          const avmNoSnapB = await invokeExpressApp(instanceB, {
+            method: 'POST',
+            url: `/api/properties/${encodeURIComponent(firstListing.id)}/avm`,
+            body: {
+              sessionId,
+              useSyntheticDemo: true,
+              clientRequestSeq: 2,
+            },
+          });
+          expect(avmNoSnapB.status).toBe(404);
+
+          // Step B2: /explain on Instance B BEFORE Instance B has seen sessionId returns 404
+          // because server-authoritative /api/explain refuses unverified client propertyContext when absent from sessionStore!
+          // (Proves why --max-instances=1 or shared session store is required on Cloud Run.)
+          const explainSplitBrainB = await invokeExpressApp(instanceB, {
+            method: 'POST',
+            url: '/api/explain',
+            body: {
+              sessionId,
+              propertyId: firstListing.id,
+              preferences: createDefaultPreferenceProfile(),
+              useSyntheticDemo: true,
+              clientRequestSeq: 3,
+            },
+          });
+          expect(explainSplitBrainB.status).toBe(404);
+
+          // Step B3: /avm WITH propertySnapshot (as sent by <App />) on Instance B reconstructs subject cleanly (200 OK)
+          const avmWithSnapB = await invokeExpressApp(instanceB, {
+            method: 'POST',
+            url: `/api/properties/${encodeURIComponent(firstListing.id)}/avm`,
+            body: {
+              sessionId,
+              propertySnapshot: {
+                formattedAddress: firstListing.formattedAddress,
+                city: firstListing.city,
+                state: firstListing.state,
+                zipCode: firstListing.zipCode,
+                latitude: firstListing.latitude,
+                longitude: firstListing.longitude,
+                propertyType: firstListing.propertyType,
+                bedrooms: firstListing.bedrooms,
+                bathrooms: firstListing.bathrooms,
+                squareFootage: firstListing.squareFootage,
+                lotSize: firstListing.lotSize,
+                yearBuilt: firstListing.yearBuilt,
+                askingPrice: firstListing.askingPrice,
+                listingLastSeenAt: firstListing.listingLastSeenAt,
+              },
+              useSyntheticDemo: true,
+              clientRequestSeq: 4,
+            },
+          });
+          expect(avmWithSnapB.status).toBe(200);
+
+          // Step A2: Same-instance /api/explain on Instance A succeeds (200 OK) with full accessibility + server authority
+          const explainSameInstanceA = await invokeExpressApp(instanceA, {
+            method: 'POST',
+            url: '/api/explain',
+            body: {
+              sessionId,
+              propertyId: firstListing.id,
+              preferences: createDefaultPreferenceProfile(),
+              useSyntheticDemo: true,
+              clientRequestSeq: 5,
+            },
+          });
+          expect(explainSameInstanceA.status).toBe(200);
+          expect(ExplainResponseSchema.safeParse(explainSameInstanceA.body).success).toBe(true);
+        } finally {
+          await propA.budgetStore.close?.();
+          await propB.budgetStore.close?.();
+        }
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
     });
   });
 });

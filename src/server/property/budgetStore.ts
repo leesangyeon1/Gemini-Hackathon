@@ -631,10 +631,49 @@ export function createBudgetStore(options: BudgetStoreOptions = {}): BudgetStore
   // ==========================================================================
   const projectId = options.googleCloudProject?.trim() ?? '';
   const collectionName = options.firestoreCollection?.trim() || 'rentcast_budget';
+  const MAX_FIRESTORE_COMMIT_ATTEMPTS = 4;
 
-  async function resolveFirestoreToken(): Promise<string> {
+  let cachedAccessToken: string | null = null;
+  let cachedTokenExpiresAtMs = 0;
+
+  // In-process async mutex so concurrent calls within a single Cloud Run instance
+  // serialize cleanly before hitting Firestore optimistic concurrency preconditions.
+  let firestoreMutexChain: Promise<void> = Promise.resolve();
+  async function withFirestoreLock<T>(fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const nextLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prevLock = firestoreMutexChain;
+    firestoreMutexChain = prevLock.then(() => nextLock);
+    await prevLock;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  class FirestorePreconditionConflictError extends Error {
+    readonly status: number;
+    constructor(status: number, message: string) {
+      super(message);
+      this.name = 'FirestorePreconditionConflictError';
+      this.status = status;
+    }
+  }
+
+  async function resolveFirestoreToken(forceRefresh = false): Promise<string> {
     if (options.firestoreAccessTokenProvider) {
       return options.firestoreAccessTokenProvider();
+    }
+    const envToken = process.env.GOOGLE_OAUTH_ACCESS_TOKEN?.trim();
+    if (envToken) {
+      return envToken;
+    }
+    const nowMs = nowFn().getTime();
+    if (!forceRefresh && cachedAccessToken && nowMs < cachedTokenExpiresAtMs) {
+      return cachedAccessToken;
     }
     const resp = await fetchFn(
       'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
@@ -646,10 +685,13 @@ export function createBudgetStore(options: BudgetStoreOptions = {}): BudgetStore
     if (!resp.ok) {
       throw new Error(`Metadata server token fetch failed with HTTP ${resp.status}`);
     }
-    const data = (await resp.json()) as { access_token?: string };
+    const data = (await resp.json()) as { access_token?: string; expires_in?: number };
     if (!data.access_token) {
       throw new Error('Metadata server response did not contain access_token');
     }
+    const ttlSeconds = Number.isFinite(data.expires_in) ? Number(data.expires_in) : 300;
+    cachedAccessToken = data.access_token;
+    cachedTokenExpiresAtMs = nowMs + Math.max(0, (ttlSeconds - 60) * 1000);
     return data.access_token;
   }
 
@@ -815,6 +857,12 @@ export function createBudgetStore(options: BudgetStoreOptions = {}): BudgetStore
       signal: AbortSignal.timeout(5_000),
     });
 
+    if (resp.status === 409 || resp.status === 400) {
+      throw new FirestorePreconditionConflictError(
+        resp.status,
+        `Firestore optimistic concurrency precondition conflict (HTTP ${resp.status})`
+      );
+    }
     if (!resp.ok) {
       throw new Error(`Firestore atomic commit failed with HTTP ${resp.status}`);
     }
@@ -880,79 +928,102 @@ export function createBudgetStore(options: BudgetStoreOptions = {}): BudgetStore
         });
       }
 
-      try {
-        const billingMonth = formatBillingMonth(nowFn());
-        const token = await resolveFirestoreToken();
-        const doc = await fetchFirestoreDoc(billingMonth, token);
-        const parsed = parseFirestoreDoc(doc, billingMonth, sessionId);
+      return withFirestoreLock(async () => {
+        try {
+          const billingMonth = formatBillingMonth(nowFn());
+          const token = await resolveFirestoreToken();
+          let rateLimitRecorded = false;
+          let lastError: unknown = null;
 
-        const preSnapshot = buildSnapshotFromCounters({
-          billingMonth,
-          globalMonthlyLimit,
-          initialSpentCalls,
-          runtimeSpentCalls: parsed.runtimeSpentCalls,
-          session: parsed.session,
-          durabilityMode: 'firestore',
-        });
+          for (let attempt = 1; attempt <= MAX_FIRESTORE_COMMIT_ATTEMPTS; attempt += 1) {
+            const doc = await fetchFirestoreDoc(billingMonth, token);
+            const parsed = parseFirestoreDoc(doc, billingMonth, sessionId);
 
-        validateReservationAgainstCaps(kind, preSnapshot);
-        checkAndRecordClientRateLimit(clientKey, preSnapshot);
+            const preSnapshot = buildSnapshotFromCounters({
+              billingMonth,
+              globalMonthlyLimit,
+              initialSpentCalls,
+              runtimeSpentCalls: parsed.runtimeSpentCalls,
+              session: parsed.session,
+              durabilityMode: 'firestore',
+            });
 
-        const nextRuntimeSpent = parsed.runtimeSpentCalls + 1;
-        const currentSession = parsed.session ?? {
-          sessionId,
-          billingMonth,
-          listingsUsed: 0,
-          avmsUsed: 0,
-          propertyRecordsUsed: 0,
-          expanded: false,
-        };
+            validateReservationAgainstCaps(kind, preSnapshot);
+            if (!rateLimitRecorded) {
+              checkAndRecordClientRateLimit(clientKey, preSnapshot);
+              rateLimitRecorded = true;
+            }
 
-        const nextSession: SessionUsageRow = {
-          ...currentSession,
-          listingsUsed:
-            currentSession.listingsUsed + (kind === 'listings' ? 1 : 0),
-          avmsUsed: currentSession.avmsUsed + (kind === 'avm' ? 1 : 0),
-          propertyRecordsUsed:
-            currentSession.propertyRecordsUsed +
-            (kind === 'property_record' ? 1 : 0),
-        };
+            const nextRuntimeSpent = parsed.runtimeSpentCalls + 1;
+            const currentSession = parsed.session ?? {
+              sessionId,
+              billingMonth,
+              listingsUsed: 0,
+              avmsUsed: 0,
+              propertyRecordsUsed: 0,
+              expanded: false,
+            };
 
-        const nextSessionsMap = {
-          ...parsed.sessionsMap,
-          [sessionId]: nextSession,
-        };
+            const nextSession: SessionUsageRow = {
+              ...currentSession,
+              listingsUsed:
+                currentSession.listingsUsed + (kind === 'listings' ? 1 : 0),
+              avmsUsed: currentSession.avmsUsed + (kind === 'avm' ? 1 : 0),
+              propertyRecordsUsed:
+                currentSession.propertyRecordsUsed +
+                (kind === 'property_record' ? 1 : 0),
+            };
 
-        await commitFirestoreState({
-          billingMonth,
-          token,
-          runtimeSpentCalls: nextRuntimeSpent,
-          sessionsMap: nextSessionsMap,
-          previousUpdateTime: parsed.updateTime,
-        });
+            const nextSessionsMap = {
+              ...parsed.sessionsMap,
+              [sessionId]: nextSession,
+            };
 
-        return buildSnapshotFromCounters({
-          billingMonth,
-          globalMonthlyLimit,
-          initialSpentCalls,
-          runtimeSpentCalls: nextRuntimeSpent,
-          session: nextSession,
-          durabilityMode: 'firestore',
-        });
-      } catch (err) {
-        if (err instanceof BudgetStoreError) {
-          throw err;
+            try {
+              await commitFirestoreState({
+                billingMonth,
+                token,
+                runtimeSpentCalls: nextRuntimeSpent,
+                sessionsMap: nextSessionsMap,
+                previousUpdateTime: parsed.updateTime,
+              });
+
+              return buildSnapshotFromCounters({
+                billingMonth,
+                globalMonthlyLimit,
+                initialSpentCalls,
+                runtimeSpentCalls: nextRuntimeSpent,
+                session: nextSession,
+                durabilityMode: 'firestore',
+              });
+            } catch (commitErr) {
+              lastError = commitErr;
+              if (
+                commitErr instanceof FirestorePreconditionConflictError &&
+                attempt < MAX_FIRESTORE_COMMIT_ATTEMPTS
+              ) {
+                continue;
+              }
+              throw commitErr;
+            }
+          }
+
+          throw lastError ?? new Error('Exhausted Firestore commit attempts');
+        } catch (err) {
+          if (err instanceof BudgetStoreError) {
+            throw err;
+          }
+          throw new BudgetStoreError({
+            code: 'BUDGET_STORE_UNAVAILABLE',
+            message: `Firestore atomic budget reservation failed closed: ${
+              err instanceof Error ? err.message : 'commit failure'
+            }`,
+            statusCode: 503,
+            uiState: 'quota_exhausted',
+            retryable: true,
+          });
         }
-        throw new BudgetStoreError({
-          code: 'BUDGET_STORE_UNAVAILABLE',
-          message: `Firestore atomic budget reservation failed closed: ${
-            err instanceof Error ? err.message : 'commit failure'
-          }`,
-          statusCode: 503,
-          uiState: 'quota_exhausted',
-          retryable: true,
-        });
-      }
+      });
     },
 
     async reserveListingsCall(sessionId: string, clientKey?: string): Promise<BudgetSnapshot> {
@@ -991,58 +1062,77 @@ export function createBudgetStore(options: BudgetStoreOptions = {}): BudgetStore
         });
       }
 
-      try {
-        const billingMonth = formatBillingMonth(nowFn());
-        const token = await resolveFirestoreToken();
-        const doc = await fetchFirestoreDoc(billingMonth, token);
-        const parsed = parseFirestoreDoc(doc, billingMonth, sessionId);
+      return withFirestoreLock(async () => {
+        try {
+          const billingMonth = formatBillingMonth(nowFn());
+          const token = await resolveFirestoreToken();
+          let lastError: unknown = null;
 
-        const currentSession = parsed.session ?? {
-          sessionId,
-          billingMonth,
-          listingsUsed: 0,
-          avmsUsed: 0,
-          propertyRecordsUsed: 0,
-          expanded: false,
-        };
-        const expandedSession: SessionUsageRow = {
-          ...currentSession,
-          expanded: true,
-        };
+          for (let attempt = 1; attempt <= MAX_FIRESTORE_COMMIT_ATTEMPTS; attempt += 1) {
+            const doc = await fetchFirestoreDoc(billingMonth, token);
+            const parsed = parseFirestoreDoc(doc, billingMonth, sessionId);
 
-        await commitFirestoreState({
-          billingMonth,
-          token,
-          runtimeSpentCalls: parsed.runtimeSpentCalls,
-          sessionsMap: {
-            ...parsed.sessionsMap,
-            [sessionId]: expandedSession,
-          },
-          previousUpdateTime: parsed.updateTime,
-        });
+            const currentSession = parsed.session ?? {
+              sessionId,
+              billingMonth,
+              listingsUsed: 0,
+              avmsUsed: 0,
+              propertyRecordsUsed: 0,
+              expanded: false,
+            };
+            const expandedSession: SessionUsageRow = {
+              ...currentSession,
+              expanded: true,
+            };
 
-        return buildSnapshotFromCounters({
-          billingMonth,
-          globalMonthlyLimit,
-          initialSpentCalls,
-          runtimeSpentCalls: parsed.runtimeSpentCalls,
-          session: expandedSession,
-          durabilityMode: 'firestore',
-        });
-      } catch (err) {
-        if (err instanceof BudgetStoreError) {
-          throw err;
+            try {
+              await commitFirestoreState({
+                billingMonth,
+                token,
+                runtimeSpentCalls: parsed.runtimeSpentCalls,
+                sessionsMap: {
+                  ...parsed.sessionsMap,
+                  [sessionId]: expandedSession,
+                },
+                previousUpdateTime: parsed.updateTime,
+              });
+
+              return buildSnapshotFromCounters({
+                billingMonth,
+                globalMonthlyLimit,
+                initialSpentCalls,
+                runtimeSpentCalls: parsed.runtimeSpentCalls,
+                session: expandedSession,
+                durabilityMode: 'firestore',
+              });
+            } catch (commitErr) {
+              lastError = commitErr;
+              if (
+                commitErr instanceof FirestorePreconditionConflictError &&
+                attempt < MAX_FIRESTORE_COMMIT_ATTEMPTS
+              ) {
+                continue;
+              }
+              throw commitErr;
+            }
+          }
+
+          throw lastError ?? new Error('Exhausted Firestore session expansion attempts');
+        } catch (err) {
+          if (err instanceof BudgetStoreError) {
+            throw err;
+          }
+          throw new BudgetStoreError({
+            code: 'BUDGET_STORE_UNAVAILABLE',
+            message: `Firestore session expansion failed closed: ${
+              err instanceof Error ? err.message : 'commit failure'
+            }`,
+            statusCode: 503,
+            uiState: 'quota_exhausted',
+            retryable: true,
+          });
         }
-        throw new BudgetStoreError({
-          code: 'BUDGET_STORE_UNAVAILABLE',
-          message: `Firestore session expansion failed closed: ${
-            err instanceof Error ? err.message : 'commit failure'
-          }`,
-          statusCode: 503,
-          uiState: 'quota_exhausted',
-          retryable: true,
-        });
-      }
+      });
     },
 
     withConcurrencySlot,

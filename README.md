@@ -28,7 +28,7 @@ Foreal-Estate helps home shoppers explore **any user-selected US location** (cit
 | [`docs/TEST-PLAN.md`](docs/TEST-PLAN.md) | Functional, numerical, license-policy, security, budget, and browser verification plan | `verifier` |
 | [`docs/VERIFICATION-REPORT.md`](docs/VERIFICATION-REPORT.md) | Executed test commands, exit codes, verified cases, and explicitly unverified/blocked items | `verifier` |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Cloud Run (`0.0.0.0:$PORT`), Secret Manager bindings, scaling caps, verification, and rollback | `release` |
-| [`docs/PROVENANCE.md`](docs/PROVENANCE.md) | Actual Antigravity CLI session, swarm roster, Gemini model usage, timestamps, and commit ledger | `release` |
+| [`docs/BUILD_PROVENANCE.md`](docs/BUILD_PROVENANCE.md) | Actual Antigravity CLI session, swarm roster, Gemini model usage, timestamps, and commit ledger | `release` |
 | [`docs/SUBMISSION-PACKAGE.md`](docs/SUBMISSION-PACKAGE.md) | Berkeley x DeepMind Hackathon one-pagers, 2-min & 5-min pitch scripts, 1-min demo script, deadlines | `release` |
 
 ---

@@ -400,6 +400,83 @@ describe('Workstream 1: Durable Atomic RentCast Budget Store (budgetStore.ts)', 
     expect(snap.totalSpentCalls).toBe(10);
     expect(snap.globalRemaining).toBe(25);
   });
+
+  it('caches Cloud Run metadata-server OAuth tokens and retries optimistic concurrency conflicts (HTTP 409) in Firestore mode', async () => {
+    let metadataTokenFetches = 0;
+    let commitAttempts = 0;
+    let docRuntimeCalls = 2;
+    let docUpdateTime = '2026-11-14T08:00:00.000000Z';
+
+    const mockCloudRunFetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.includes('metadata.google.internal')) {
+        metadataTokenFetches += 1;
+        const headers = new Headers(init?.headers);
+        expect(headers.get('Metadata-Flavor')).toBe('Google');
+        return new Response(
+          JSON.stringify({
+            access_token: 'ya29.mock_cloud_run_sa_token',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url.endsWith(':commit') && init?.method === 'POST') {
+        commitAttempts += 1;
+        // Simulate a concurrent Cloud Run instance winning the first write (409 ABORTED)
+        if (commitAttempts === 1) {
+          docRuntimeCalls = 3;
+          docUpdateTime = '2026-11-14T08:00:01.000000Z';
+          return new Response(
+            JSON.stringify({
+              error: { code: 409, status: 'ABORTED', message: 'Precondition failed' },
+            }),
+            { status: 409, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        docRuntimeCalls += 1;
+        docUpdateTime = '2026-11-14T08:00:02.000000Z';
+        return new Response(JSON.stringify({ writeResults: [{}] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          name: 'projects/cloudrun-proj/databases/(default)/documents/rentcast_budget/2026-11',
+          updateTime: docUpdateTime,
+          fields: {
+            runtimeSpentCalls: { integerValue: String(docRuntimeCalls) },
+            sessions: { mapValue: { fields: {} } },
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    const cloudRunStore = createBudgetStore({
+      mode: 'firestore',
+      googleCloudProject: 'cloudrun-proj',
+      fetchFn: mockCloudRunFetch,
+      globalMonthlyLimit: 35,
+      initialSpentCalls: 1,
+      nowFn: () => new Date('2026-11-14T08:05:00.000Z'),
+    });
+
+    // First call triggers metadata token fetch + 1st commit (409 conflict) + re-read + 2nd commit (200 OK)
+    const snap1 = await cloudRunStore.reserveAvmCall('sess_cr_1', 'client-cr');
+    expect(commitAttempts).toBe(2);
+    expect(metadataTokenFetches).toBe(1);
+    expect(snap1.runtimeSpentCalls).toBe(4);
+    expect(snap1.totalSpentCalls).toBe(5);
+
+    // Second operation reuses cached Cloud Run metadata token without re-fetching metadata.google.internal
+    const snap2 = await cloudRunStore.getSnapshot('sess_cr_1');
+    expect(metadataTokenFetches).toBe(1);
+    expect(snap2.runtimeSpentCalls).toBe(4);
+  });
 });
 
 describe('Workstream 1: US Region Resolver & Disambiguation (regionResolver.ts)', () => {

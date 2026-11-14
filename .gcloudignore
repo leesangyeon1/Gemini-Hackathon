@@ -1,0 +1,32 @@
+# Git & editor metadata
+.git/
+.gitignore
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Dependencies & build outputs (rebuilt cleanly by Cloud Build via Dockerfile)
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Local environment secrets (NEVER upload to Cloud Build / Cloud Run)
+.env
+.env.*
+
+# Local SQLite budget & cache artifacts
+.data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Tests, coverage & logs
+tests/
+coverage/
+logs/
+*.log
+npm-debug.log*

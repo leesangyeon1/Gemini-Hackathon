@@ -12,7 +12,7 @@
 > 2. **Track Confirmation & Social Tracking Duration Conflict:** Confirm your intended submission track (**In-person** vs. **Online-only**) and verify the **social-media tracking duration conflict (`7 days` vs. `2 weeks`) directly on the official hackathon submission form** before checking any consent or posting agreement.
 > 3. **VC Prize Clarification:** The VC prize listed by the event is a **VC meeting**, **not** guaranteed funding or an investment commitment.
 > 4. **Organizer & Marketing Consent Control:** Organizer/marketing data-sharing and promotional consents remain **strictly under the user's control** — review every checkbox on the official form manually before submitting.
-> 5. **Hosted Prototype URL Status:** **`BLOCKED / NOT DEPLOYED`** (see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md#7-current-deployment-blockers)). Do **not** submit a fake or placeholder live URL; deploy via `./scripts/deploy-cloud-run.sh` with confirmed GCP credentials first, or submit under local/repository review instructions if permitted by your track.
+> 5. **Hosted Prototype URL Status:** **`BLOCKED / NOT DEPLOYED`** (see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md#7-current-deployment-blockers) and [`docs/BUILD_PROVENANCE.md`](BUILD_PROVENANCE.md)). Do **not** submit a fake or placeholder live URL; deploy via `./scripts/deploy-cloud-run.sh` with confirmed GCP credentials first, or submit under local/repository review instructions if permitted by your track.
 
 ---
 
